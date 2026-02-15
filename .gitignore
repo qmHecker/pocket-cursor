@@ -1,0 +1,25 @@
+# User config (contains secrets)
+.env
+
+# PocketCursor runtime state (auto-generated)
+.owner_id
+.chat_id
+.bridge.lock
+.muted
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
