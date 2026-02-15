@@ -6,8 +6,7 @@ The conversation doesn't have to end. PocketCursor bridges your running Cursor I
 
 Not a remote agent. Not a cloud service. YOUR Cursor, accessible from wherever you are.
 
-<!-- TODO: Demo video embed -->
-<!-- [![Demo](demo-thumbnail.png)](https://youtube.com/watch?v=...) -->
+[![Demo video](https://img.youtube.com/vi/hK7GIbRTzYo/maxresdefault.jpg)](https://www.youtube.com/watch?v=hK7GIbRTzYo)
 
 ## Features
 
