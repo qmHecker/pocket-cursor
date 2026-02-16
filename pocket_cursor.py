@@ -1186,9 +1186,11 @@ def cursor_get_turn_info():
                         const codeBlock = child.querySelector('.markdown-block-code');
                         if (codeBlock) {
                             const text = child.innerText.trim();
-                            const selector = '#bubble-' + bubbleSuffix +
-                                ' .markdown-block-code' +
-                                (codeBlockIndex > 0 ? ':nth-of-type(' + (codeBlockIndex + 1) + ')' : '');
+                            // Use the section's unique DOM id for a reliable selector
+                            // (:nth-of-type breaks because each code block is in a different parent section)
+                            const selector = child.id
+                                ? '#' + child.id + ' .markdown-block-code'
+                                : '#bubble-' + bubbleSuffix + ' .markdown-block-code';
                             sections.push({
                                 text: text,
                                 type: 'code_block',
@@ -1196,7 +1198,6 @@ def cursor_get_turn_info():
                                 selector: selector
                             });
                             subIdx++;
-                            codeBlockIndex++;
                         } else {
                             const text = getSectionText(child);
                             if (text.length > 0) {
