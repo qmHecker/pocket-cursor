@@ -27,6 +27,9 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+# Sibling module
+from start_cursor import get_used_ports
+
 # Third-party
 import requests
 import websocket
@@ -226,8 +229,25 @@ def transcribe_voice(audio_bytes, filename='voice.ogg'):
 
 # ── CDP helpers ──────────────────────────────────────────────────────────────
 
+def detect_cdp_port():
+    """Auto-detect the CDP port from running Cursor processes.
+    
+    Uses start_cursor.get_used_ports() to parse process command lines.
+    Exits with a clear error if no CDP-enabled Cursor is found.
+    """
+    ports = get_used_ports()
+    if not ports:
+        print("ERROR: No Cursor process with CDP detected.")
+        print("Start Cursor with CDP first:  python start_cursor.py")
+        print("Or check status:              python start_cursor.py --check")
+        sys.exit(1)
+    return ports[0]
+
+
 def cdp_connect():
-    targets = requests.get('http://localhost:9222/json').json()
+    port = detect_cdp_port()
+    print(f"[cdp] Using port {port}")
+    targets = requests.get(f'http://localhost:{port}/json').json()
     # Prefer a Cursor page with an actual vscode-file URL (not about:blank).
     # When multiple Cursor windows are open, about:blank targets are stale/secondary.
     page = next(
