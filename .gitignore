@@ -7,6 +7,10 @@
 .bridge.lock
 .muted
 
+# Local test/scratch scripts
+_test_*.py
+.commitmsg
+
 # Python
 __pycache__/
 *.py[cod]
