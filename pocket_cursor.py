@@ -70,12 +70,16 @@ chat_id_file = Path(__file__).parent / '.chat_id'
 
 # Shared state
 cdp_lock = threading.Lock()
-ws = None
+ws = None                    # Active instance's WebSocket (all cdp_* functions use this)
+instance_registry = {}       # {target_id: {workspace, ws, ws_url, title}}
+active_instance_id = None    # Which instance ws points to
+mirrored_chat = None         # (instance_id, pc_id, chat_name) — the ONE chat being mirrored
 # Load chat_id from disk so PC messages work after restart without a Telegram message first
 chat_id = int(chat_id_file.read_text().strip()) if chat_id_file.exists() else None
 chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
 muted = muted_file.exists()  # Persisted across restarts
+active_chat_file = Path(__file__).parent / '.active_chat'
 # Note: no reinit_monitor — monitor tracks continuously even while muted,
 # just skips Telegram sends. This keeps forwarded_ids in sync at all times.
 last_sent_text = None  # Last message sent by the sender thread
@@ -232,8 +236,10 @@ def transcribe_voice(audio_bytes, filename='voice.ogg'):
 def detect_cdp_port():
     """Auto-detect the CDP port from running Cursor processes.
     
-    Uses start_cursor.get_used_ports() to parse process command lines.
-    Exits with a clear error if no CDP-enabled Cursor is found.
+    Uses start_cursor.get_used_ports() to parse process command lines,
+    then verifies each port actually responds.  On Windows, merged windows
+    leave ghost --remote-debugging-port entries in the launcher process's
+    command line even though only the original port is bound.
     """
     ports = get_used_ports()
     if not ports:
@@ -241,49 +247,189 @@ def detect_cdp_port():
         print("Start Cursor with CDP first:  python start_cursor.py")
         print("Or check status:              python start_cursor.py --check")
         sys.exit(1)
-    return ports[0]
+    for port in ports:
+        try:
+            resp = requests.get(f'http://localhost:{port}/json', timeout=2)
+            if resp.status_code == 200:
+                return port
+        except Exception:
+            pass
+    print("ERROR: Cursor process found but no CDP port is responding.")
+    print(f"Ports in command line: {ports}")
+    print("Start Cursor with CDP first:  python start_cursor.py")
+    sys.exit(1)
+
+
+def parse_instance_title(title):
+    """Extract workspace name from a Cursor instance title.
+    
+    Title patterns:
+        "Cursor"                                              → no workspace
+        "file.py - WorkspaceName - Cursor"                    → "WorkspaceName"
+        "file.md - Name (Workspace) - Cursor"                 → "Name (Workspace)"
+        "Interactive - file.py - WorkspaceName - Cursor"      → "WorkspaceName"
+    
+    Workspace is always the second-to-last segment before "- Cursor".
+    """
+    parts = title.split(' - ')
+    if len(parts) >= 3 and parts[-1].strip() == 'Cursor':
+        return parts[-2]
+    return None
+
+
+def cdp_list_instances(port=None):
+    """List all Cursor instances on the CDP port.
+    
+    Returns list of dicts: {id, title, workspace, ws_url}
+    Instances without a workspace (e.g. "select workspace" screen) get workspace=None.
+    """
+    if port is None:
+        port = detect_cdp_port()
+    targets = requests.get(f'http://localhost:{port}/json').json()
+    instances = []
+    for t in targets:
+        if t['type'] != 'page':
+            continue
+        if not t.get('url', '').startswith('vscode-file://'):
+            continue
+        instances.append({
+            'id': t['id'],
+            'title': t.get('title', ''),
+            'workspace': parse_instance_title(t.get('title', '')),
+            'ws_url': t['webSocketDebuggerUrl'],
+        })
+    return instances
 
 
 def cdp_connect():
+    """Connect to all Cursor instances. Sets ws to the first instance with a workspace."""
+    global ws, instance_registry, active_instance_id
     port = detect_cdp_port()
     print(f"[cdp] Using port {port}")
-    targets = requests.get(f'http://localhost:{port}/json').json()
-    # Prefer a Cursor page with an actual vscode-file URL (not about:blank).
-    # When multiple Cursor windows are open, about:blank targets are stale/secondary.
-    page = next(
-        (t for t in targets
-         if t['type'] == 'page'
-         and 'Cursor' in t.get('title', '')
-         and t.get('url', '').startswith('vscode-file://')),
-        # Fallback: any Cursor page (including about:blank)
-        next(
-            (t for t in targets if t['type'] == 'page' and 'Cursor' in t.get('title', '')),
-            # Last resort: any non-devtools page
-            next(t for t in targets if t['type'] == 'page' and 'devtools' not in t.get('url', ''))
+    instances = cdp_list_instances(port)
+
+    if not instances:
+        print("ERROR: No Cursor instances found on CDP port.")
+        sys.exit(1)
+
+    # Connect to all instances, populate registry
+    instance_registry.clear()
+    for w in instances:
+        label = w['workspace'] or '(no workspace)'
+        try:
+            conn = websocket.create_connection(w['ws_url'])
+            instance_registry[w['id']] = {
+                'workspace': w['workspace'],
+                'title': w['title'],
+                'ws': conn,
+                'ws_url': w['ws_url'],
+                'convs': {},  # {pc_id: {name, active}} — populated by overview thread
+            }
+            cursor_inject_tab_observer(conn)
+            print(f"[cdp] Connected: {label}  [{w['id'][:8]}]")
+        except Exception as e:
+            print(f"[cdp] Failed to connect to {label}: {e}")
+
+    if not instance_registry:
+        print("ERROR: Could not connect to any Cursor instance.")
+        sys.exit(1)
+
+    # Scan conversations FIRST (needed for persisted state restore)
+    for iid, info in instance_registry.items():
+        if info['workspace']:
+            try:
+                convs = cursor_scan_convs(info['ws'])
+                info['convs'] = {c['pc_id']: {'name': c['name'], 'active': c['active']} for c in convs}
+                names = [c['name'] for c in convs]
+                print(f"[cdp] Conversations in {info['workspace']}: {names}")
+            except Exception:
+                pass
+
+    # Set active instance: (1) focus detection, (2) persisted state, (3) first with workspace
+    active_instance_id = None
+
+    # Try focus detection (works if user is at desk with chat input focused)
+    for wid, info in instance_registry.items():
+        chat = cursor_check_chat_focus(info['ws'])
+        if chat:
+            active_instance_id = wid
+            mirrored_chat = (wid, chat['pc_id'], chat['name'])
+            print(f"[cdp] Active (focused): {info['workspace']} — {chat['name']}")
+            break
+
+    # Try persisted state (works after restart from phone)
+    if not active_instance_id and active_chat_file.exists():
+        try:
+            saved = json.loads(active_chat_file.read_text())
+            saved_ws = saved.get('workspace')
+            saved_pc_id = saved.get('pc_id')
+            saved_name = saved.get('chat_name')
+            # Match by workspace + pc_id (pc_ids survive in Cursor's DOM)
+            for wid, info in instance_registry.items():
+                if info['workspace'] == saved_ws:
+                    for pc_id, conv in info.get('convs', {}).items():
+                        if pc_id == saved_pc_id or conv['name'] == saved_name:
+                            active_instance_id = wid
+                            mirrored_chat = (wid, pc_id, conv['name'])
+                            print(f"[cdp] Active (restored): {info['workspace']} — {conv['name']}")
+                            break
+                if active_instance_id:
+                    break
+        except Exception:
+            pass
+
+    # Fallback: first instance with a workspace
+    if not active_instance_id:
+        active_instance_id = next(
+            (wid for wid, info in instance_registry.items() if info['workspace']),
+            next(iter(instance_registry))
         )
-    )
-    print(f"[cdp] Connected to: {page.get('title', '?')}  url={page.get('url', '?')[:80]}")
-    return websocket.create_connection(page['webSocketDebuggerUrl'])
+        active_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
+        print(f"[cdp] Active (default): {active_name}")
+    ws = instance_registry[active_instance_id]['ws']
 
 
 msg_id_counter = 0
 msg_id_lock = threading.Lock()
 
 
-def cdp_eval(expression):
-    """Evaluate JS in Cursor. Thread-safe via cdp_lock."""
-    global ws, msg_id_counter
+def cdp_eval_on(conn, expression):
+    """Evaluate JS on a specific WebSocket connection. Thread-safe via cdp_lock."""
+    global msg_id_counter
     with msg_id_lock:
         msg_id_counter += 1
         mid = msg_id_counter
     with cdp_lock:
-        ws.send(json.dumps({
+        conn.send(json.dumps({
             'id': mid,
             'method': 'Runtime.evaluate',
             'params': {'expression': expression, 'returnByValue': True}
         }))
-        result = json.loads(ws.recv())
+        result = json.loads(conn.recv())
     return result.get('result', {}).get('result', {}).get('value')
+
+
+def cdp_eval(expression):
+    """Evaluate JS on the active instance. Thread-safe via cdp_lock."""
+    return cdp_eval_on(ws, expression)
+
+
+def cdp_bring_to_front(conn):
+    """Bring a Cursor window to the foreground via CDP Page.bringToFront.
+    
+    Uses the existing WebSocket connection — no window title matching needed.
+    Cross-platform: works on Windows, macOS, and Linux.
+    """
+    global msg_id_counter
+    with msg_id_lock:
+        msg_id_counter += 1
+        mid = msg_id_counter
+    with cdp_lock:
+        conn.send(json.dumps({
+            'id': mid,
+            'method': 'Page.bringToFront',
+        }))
+        conn.recv()
 
 
 def cdp_insert_text(text):
@@ -615,6 +761,244 @@ def cursor_list_convs():
         return []
 
 
+def cursor_check_chat_focus(conn):
+    """Detect which chat input has OS focus in this instance.
+
+    Returns {name, pc_id} dict if a Lexical editor is focused, or None.
+    Handles both agent-tabs chats and editor-group chats (split view).
+    Uses document.hasFocus() so only the foreground window can return a result.
+    """
+    result = cdp_eval_on(conn, """
+        (function() {
+            if (!document.hasFocus()) return null;
+            const el = document.activeElement;
+            if (!el) return null;
+
+            // Strategy 1: any focused element inside an editor-group chat (split view / file tabs)
+            // Works for both Lexical editor focus (typing) and tab/content clicks
+            const groups = document.querySelectorAll('.editor-group-container.has-composer-editor');
+            for (const g of groups) {
+                if (g.contains(el)) {
+                    const tab = g.querySelector('.tab.selected .composer-tab-label') || g.querySelector('.tab .composer-tab-label');
+                    const tabEl = tab ? tab.closest('.tab') : null;
+                    if (tab && tabEl) return JSON.stringify({
+                        name: tab.textContent.trim(),
+                        pc_id: tabEl.getAttribute('data-pc-id') || ''
+                    });
+                }
+            }
+
+            // Strategy 2: Lexical editor focused in the main agent-tabs panel
+            if (el.getAttribute('data-lexical-editor') === 'true' && el.contentEditable === 'true') {
+                const checkedLi = document.querySelector('[class*="agent-tabs"] li.checked');
+                if (checkedLi) {
+                    const a = checkedLi.querySelector('a[aria-id="chat-horizontal-tab"]');
+                    return JSON.stringify({
+                        name: a ? (a.getAttribute('aria-label') || a.textContent.trim()) : '',
+                        pc_id: checkedLi.getAttribute('data-pc-id') || ''
+                    });
+                }
+            }
+
+            return null;
+        })();
+    """)
+    if not result or result == 'null':
+        return None
+    try:
+        return json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def cursor_inject_tab_observer(conn):
+    """Inject a MutationObserver that watches for chat tab activations.
+
+    Detects tab switches regardless of how they were triggered (tab click,
+    Open Editors sidebar, keyboard shortcut, command palette, etc.) by
+    observing class changes on tab elements (checked/selected).
+    Idempotent — safe to call multiple times on the same instance.
+    """
+    cdp_eval_on(conn, """
+        (function() {
+            if (window.__pc_tab_observer) return 'ALREADY_INSTALLED';
+            window.__pc_active_tab = null;
+
+            const observer = new MutationObserver(mutations => {
+                for (const m of mutations) {
+                    if (m.attributeName !== 'class') continue;
+                    const el = m.target;
+
+                    // Agent-tab <li> became checked
+                    if (el.tagName === 'LI' && el.classList.contains('checked')) {
+                        const a = el.querySelector('a[aria-id="chat-horizontal-tab"]');
+                        if (a) {
+                            window.__pc_active_tab = {
+                                name: a.getAttribute('aria-label') || a.textContent.trim(),
+                                pc_id: el.getAttribute('data-pc-id') || '',
+                                ts: Date.now()
+                            };
+                        }
+                    }
+
+                    // Editor-group tab became selected
+                    if (el.classList.contains('tab') && el.classList.contains('selected')) {
+                        const label = el.querySelector('.composer-tab-label');
+                        if (label) {
+                            window.__pc_active_tab = {
+                                name: label.textContent.trim(),
+                                pc_id: el.getAttribute('data-pc-id') || '',
+                                ts: Date.now()
+                            };
+                        }
+                    }
+
+                    // Editor-group became active (lost 'inactive' class)
+                    // Catches: Open Editors sidebar click, clicking into a split-view chat
+                    if (el.classList.contains('editor-group-container')
+                        && el.classList.contains('has-composer-editor')
+                        && !el.classList.contains('inactive')) {
+                        const tab = el.querySelector('.tab.selected .composer-tab-label');
+                        const tabEl = tab ? tab.closest('.tab') : null;
+                        if (tab && tabEl) {
+                            window.__pc_active_tab = {
+                                name: tab.textContent.trim(),
+                                pc_id: tabEl.getAttribute('data-pc-id') || '',
+                                ts: Date.now()
+                            };
+                        }
+                    }
+                }
+            });
+
+            observer.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: true });
+
+            window.__pc_tab_observer = true;
+            return 'INSTALLED';
+        })();
+    """)
+
+
+def cursor_poll_tab_observer(conn):
+    """Read and clear the latest tab activation from the MutationObserver.
+
+    Returns {name, pc_id, ts} if a tab was activated since last poll, else None.
+    """
+    result = cdp_eval_on(conn, """
+        (function() {
+            const data = window.__pc_active_tab;
+            window.__pc_active_tab = null;
+            return data ? JSON.stringify(data) : null;
+        })();
+    """)
+    if not result or result == 'null':
+        return None
+    try:
+        return json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def cursor_get_active_editor_chat(conn):
+    """Get the active editor-group chat (if any) in this instance.
+
+    Checks for a non-inactive editor-group-container that has a composer editor,
+    and returns the selected tab's name and pc_id. This catches chat activations
+    from any UI surface (Open Editors sidebar, keyboard shortcuts, etc.) that
+    the MutationObserver might miss.
+
+    Returns {name, pc_id} or None.
+    """
+    result = cdp_eval_on(conn, """
+        (function() {
+            const groups = document.querySelectorAll('.editor-group-container');
+            for (const g of groups) {
+                if (g.classList.contains('inactive')) continue;
+                // Check if this group has a chat (composer editor)
+                const composer = g.querySelector('[data-lexical-editor="true"]');
+                if (!composer) continue;
+                // Get the selected tab with a composer-tab-label
+                const label = g.querySelector('.tab.selected .composer-tab-label');
+                const tabEl = label ? label.closest('.tab') : null;
+                if (label && tabEl) {
+                    return JSON.stringify({
+                        name: label.textContent.trim(),
+                        pc_id: tabEl.getAttribute('data-pc-id') || ''
+                    });
+                }
+            }
+            return null;
+        })();
+    """)
+    if not result or result == 'null':
+        return None
+    try:
+        return json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def cursor_scan_convs(conn):
+    """Scan conversation tabs on a specific instance. Assigns data-pc-id to untagged tabs.
+    
+    Returns [{pc_id, name, active}] for all conversation tabs.
+    Finds chats in two locations:
+      1. Agent-tabs bar (main chat panel with horizontal tabs)
+      2. Editor-group tabs (split-view: chats opened as separate editor panels)
+    Uses cdp_eval_on so it works on any instance, not just the active one.
+    """
+    result = cdp_eval_on(conn, """
+        (function() {
+            const results = [];
+
+            // 1. Agent-tabs: main chat panel with horizontal tab bar
+            const agentTabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
+            agentTabs.forEach(a => {
+                const li = a.closest('li');
+                if (!li.getAttribute('data-pc-id')) {
+                    li.setAttribute('data-pc-id', 'pc-' + Math.random().toString(36).slice(2, 10));
+                }
+                results.push({
+                    pc_id: li.getAttribute('data-pc-id'),
+                    name: a.getAttribute('aria-label') || '',
+                    active: li.classList.contains('checked')
+                });
+            });
+
+            // 2. Editor-group tabs: chats in separate editor panels (split view)
+            const editorGroups = document.querySelectorAll('.editor-group-container.has-composer-editor');
+            editorGroups.forEach(group => {
+                const tab = group.querySelector('.tab .composer-tab-label');
+                if (!tab) return;
+                const tabEl = tab.closest('.tab');
+                if (!tabEl) return;
+                const name = tab.textContent.trim();
+                // Use data-resource-name as stable ID (UUID assigned by Cursor)
+                const resName = tabEl.getAttribute('data-resource-name') || '';
+                const pcId = 'eg-' + resName.substring(0, 8);
+                // Tag the tab for click-targeting later
+                if (!tabEl.getAttribute('data-pc-id')) {
+                    tabEl.setAttribute('data-pc-id', pcId);
+                }
+                // Active = tab has the 'active' class (VS Code sets this on THE focused tab across all groups)
+                // More reliable than checking group's 'inactive' class which doesn't change for panel focus
+                const isActive = tabEl.classList.contains('active');
+                results.push({
+                    pc_id: tabEl.getAttribute('data-pc-id'),
+                    name: name,
+                    active: isActive
+                });
+            });
+
+            return JSON.stringify(results);
+        })();
+    """)
+    try:
+        return json.loads(result) if result else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def cursor_switch_conv(index):
     """Switch to conversation tab by 0-based index. Returns the tab name or error."""
     return cdp_eval(f"""
@@ -874,7 +1258,7 @@ def check_owner(user_id, cid):
 
 
 def sender_thread():
-    global chat_id, OWNER_ID, last_sent_text, last_tg_message_id, muted
+    global chat_id, OWNER_ID, last_sent_text, last_tg_message_id, muted, active_instance_id, mirrored_chat
     print("[sender] Starting Telegram poller...")
 
     # Drain any pending updates from before this restart
@@ -910,20 +1294,85 @@ def sender_thread():
                     with pending_confirms_lock:
                         selectors = pending_confirms.pop(tool_id, None)
 
-                    if action == 'agent':
-                        # Switch conversation tab
-                        try:
-                            idx = int(tool_id)
-                        except ValueError:
-                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid')
-                            continue
-                        result = cursor_switch_conv(idx)
-                        if result and result.startswith('ERROR'):
-                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text=result)
+                    if cb_data == 'noop':
+                        tg_call('answerCallbackQuery', callback_query_id=cb_id)
+                        continue
+
+                    if action in ('agent', 'chat'):
+                        # New format: chat:{instance_id}:{pc_id}
+                        parts = cb_data.split(':', 2)
+                        if len(parts) == 3:
+                            _, target_iid, target_pc_id = parts
+                            info = instance_registry.get(target_iid)
+                            if not info:
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Instance not found')
+                                continue
+                            # Click the tab with matching data-pc-id (works for both agent-tabs and editor-group tabs)
+                            # Note: querySelectorAll because file tabs can share the same data-pc-id
+                            # as adjacent chat tabs — we filter for the actual chat tab.
+                            result = cdp_eval_on(info['ws'], f"""
+                                (function() {{
+                                    const candidates = document.querySelectorAll('[data-pc-id="{target_pc_id}"]');
+                                    let el = null;
+                                    for (const c of candidates) {{
+                                        // Agent-tab: <li> with chat link
+                                        if (c.querySelector('a[aria-id="chat-horizontal-tab"]')) {{ el = c; break; }}
+                                        // Editor-group tab: has .composer-tab-label
+                                        if (c.querySelector('.composer-tab-label')) {{ el = c; break; }}
+                                    }}
+                                    if (!el) return 'ERROR: tab not found (pc_id={target_pc_id}, checked ' + candidates.length + ' candidates)';
+                                    // Agent-tab: click the <a> inside the <li>
+                                    const a = el.querySelector('a[aria-id="chat-horizontal-tab"]');
+                                    if (a) {{ a.click(); return a.getAttribute('aria-label') || 'OK'; }}
+                                    // Editor-group tab: use mousedown (VS Code activates tabs on mousedown, not click)
+                                    el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, button: 0}}));
+                                    const label = el.querySelector('.label-name');
+                                    return label ? label.textContent.trim() || 'OK' : 'OK';
+                                }})();
+                            """)
+                            if result and result.startswith('ERROR'):
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=result)
+                            else:
+                                # Switch active instance if needed
+                                if target_iid != active_instance_id:
+                                    with cdp_lock:
+                                        active_instance_id = target_iid
+                                        ws = info['ws']
+                                    print(f"[sender] Switched instance to: {info['workspace']}")
+                                    # Bring the target Cursor window to the foreground via CDP
+                                    try:
+                                        cdp_bring_to_front(info['ws'])
+                                    except Exception as e:
+                                        print(f"[sender] Could not bring window to front: {e}")
+                                # Update mirrored_chat immediately (don't wait for overview thread)
+                                chat_name = result if result and result != 'OK' else target_pc_id
+                                mirrored_chat = (target_iid, target_pc_id, chat_name)
+                                ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
+                                if chat_id:
+                                    tg_send(chat_id, f"💬 Mirroring chat: {ws_label} / {chat_name}")
+                                try:
+                                    active_chat_file.write_text(json.dumps({
+                                        'workspace': info.get('workspace'),
+                                        'chat_name': chat_name,
+                                        'pc_id': target_pc_id,
+                                    }))
+                                except Exception:
+                                    pass
+                            print(f"[sender] Agent switch: {result}")
                         else:
-                            # Just toast — monitor will send the 💬 message when it detects the switch
-                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
-                        print(f"[sender] Agent switch: {result}")
+                            # Legacy format: agent:{index}
+                            try:
+                                idx = int(tool_id)
+                            except ValueError:
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid')
+                                continue
+                            result = cursor_switch_conv(idx)
+                            if result and result.startswith('ERROR'):
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=result)
+                            else:
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
+                            print(f"[sender] Agent switch: {result}")
                     elif selectors and action in ('accept', 'reject'):
                         btn_selector = selectors['accept'] if action == 'accept' else selectors['reject']
                         print(f"[sender] Callback: {action} tool {tool_id[:12]}...")
@@ -1095,35 +1544,23 @@ def sender_thread():
                         tg_send(cid, "Failed to capture screenshot.")
                     continue
 
-                if text in ('/agents', '/agent'):
-                    convs = cursor_list_convs()
-                    if not convs:
-                        tg_send(cid, "No conversation tabs found.")
-                    else:
-                        keyboard = []
-                        for i, c in enumerate(convs):
-                            prefix = '▶ ' if c['active'] else ''
-                            keyboard.append([{'text': f"{prefix}{c['name']}", 'callback_data': f"agent:{i}"}])
-                        tg_call('sendMessage', chat_id=cid, text='💬 Agents:',
-                                reply_markup={'inline_keyboard': keyboard})
-                    continue
-
-                if text.startswith('/agent '):
-                    arg = text[7:].strip()
-                    try:
-                        idx = int(arg) - 1  # User sends 1-based
-                    except ValueError:
-                        # Try matching by name substring
-                        convs = cursor_list_convs()
-                        idx = next((i for i, c in enumerate(convs) if arg.lower() in c['name'].lower()), -1)
-                        if idx < 0:
-                            tg_send(cid, f"No agent matching '{arg}'. Send /agents to see the list.")
+                if text in ('/chats', '/agents', '/agent'):
+                    any_chats = False
+                    for iid, info in instance_registry.items():
+                        convs = info.get('convs', {})
+                        if not convs:
                             continue
-                    result = cursor_switch_conv(idx)
-                    if result and result.startswith('ERROR'):
-                        tg_send(cid, result)
-                    # else: monitor will send 💬 Switched to: when it detects the change
-                    print(f"[sender] Agent switch: {result}")
+                        any_chats = True
+                        ws_name = (info['workspace'] or '(no workspace)').removesuffix(' (Workspace)')
+                        keyboard = []
+                        for pc_id, conv in convs.items():
+                            is_mirrored = mirrored_chat and mirrored_chat[0] == iid and mirrored_chat[1] == pc_id
+                            prefix = '▶ ' if is_mirrored else ''
+                            keyboard.append([{'text': f"{prefix}{conv['name']}", 'callback_data': f"chat:{iid}:{pc_id}"}])
+                        tg_call('sendMessage', chat_id=cid, text=f'📂 {ws_name}',
+                                reply_markup={'inline_keyboard': keyboard})
+                    if not any_chats:
+                        tg_send(cid, "No chats found.")
                     continue
 
                 # Record what we're sending (so monitor knows which turn is ours)
@@ -1190,8 +1627,7 @@ def monitor_thread():
             # Detect conversation tab switch → reset and skip all existing content
             if conv and last_conv is not None and conv != last_conv:
                 print(f"[monitor] Conversation switched: '{last_conv[:40]}' → '{conv[:40]}', skipping {len(sections)} sections")
-                if not muted:
-                    tg_send(cid, f"💬 Switched to: {conv}")
+                # Overview thread already sends the more informative "{workspace}: {chat_name}" notification
                 forwarded_ids = {
                     sec.get('id', '') for sec in sections
                     if isinstance(sec, dict) and sec.get('id')
@@ -1399,6 +1835,274 @@ def monitor_thread():
             time.sleep(2)
 
 
+# ── Overview thread ──────────────────────────────────────────────────────────
+#
+# Active Chat Detection Strategies
+# =================================
+# The overview thread detects which chat the user is interacting with using
+# three complementary signals, evaluated in priority order each tick:
+#
+# Signal 1 — Chat input focus  (cursor_check_chat_focus)
+#   Mechanism: Polls document.hasFocus() + document.activeElement for a
+#              focused Lexical editor (contentEditable=true) inside a chat panel.
+#   Catches:   User clicks into a chat's text input field.
+#   Scope:     All instances (checks each via its own WebSocket).
+#   Limitation: Only fires when the Lexical editor itself has OS focus,
+#               not when the user clicks a tab or sidebar entry.
+#
+# Signal 2 — MutationObserver on tab classes  (cursor_inject_tab_observer / cursor_poll_tab_observer)
+#   Mechanism: A MutationObserver injected once per instance watches for
+#              class attribute changes on DOM elements. Three triggers:
+#              (a) Agent-tab <li> gains 'checked' class → user switched chat tab
+#              (b) Editor-group .tab gains 'selected' class → split-view tab switch
+#              (c) Editor-group-container loses 'inactive' class → group activation
+#   Catches:   Tab clicks in the agent-tabs bar, editor-group tab clicks,
+#              keyboard shortcuts, command palette actions — anything that
+#              causes a CSS class change on tab/group elements.
+#   Scope:     All instances (observer installed per instance, polled each tick).
+#   Limitation: Doesn't fire when the tab was already checked/selected and
+#               the user activates it from elsewhere (e.g. Open Editors sidebar
+#               click on an already-selected editor-group chat).
+#
+# Signal 3 — Active editor-group poll  (cursor_get_active_editor_chat)
+#   Mechanism: Every tick, queries each instance for any non-inactive
+#              editor-group-container that has a composer editor, and reads
+#              the selected tab's name/pc_id.
+#   Catches:   Open Editors sidebar clicks, any activation path that doesn't
+#              trigger DOM class mutations (the "catch-all" for editor-group chats).
+#   Scope:     All instances.
+#   Limitation: Only detects editor-group chats (split view), not agent-tabs
+#               panel chats. Those are covered by Signals 1 and 2.
+#
+# Together these three signals cover all known activation paths:
+#   - Clicking a chat tab in agent-tabs bar      → Signal 2a
+#   - Clicking into a chat's text input          → Signal 1
+#   - Clicking a chat in Open Editors sidebar    → Signal 3
+#   - Clicking an editor-group tab               → Signal 2b
+#   - Switching to another Cursor instance       → Signal 1 or 2 (whichever fires first)
+#   - Keyboard shortcut / command palette        → Signal 2
+#
+# Additionally, the monitor thread independently detects conversation switches
+# via cursor_get_turn_info() (compares conv name each poll). This is not for
+# notification but for resetting the monitor's internal forwarding state
+# (forwarded_ids, prev_by_id, etc.) to avoid forwarding stale content.
+
+FOCUS_INTERVAL = 1    # seconds between focus checks (cheap)
+SCAN_INTERVAL = 3     # seconds between full rescans (heavier)
+
+def overview_thread():
+    """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
+    global ws, active_instance_id, mirrored_chat
+    print("[overview] Starting instance monitor...")
+    tick = 0
+    # If mirrored_chat wasn't set by cdp_connect (no focus, no persisted state),
+    # initialize from the active instance's checked tab
+    if not mirrored_chat and active_instance_id and active_instance_id in instance_registry:
+        info = instance_registry[active_instance_id]
+        for pc_id, conv in info.get('convs', {}).items():
+            if conv['active']:
+                mirrored_chat = (active_instance_id, pc_id, conv['name'])
+                break
+    while True:
+        try:
+            time.sleep(FOCUS_INTERVAL)
+            tick += 1
+            do_full_scan = (tick % (SCAN_INTERVAL // FOCUS_INTERVAL) == 0)
+
+            # ── Detect active chat (runs every tick) ──
+            # Two signals: (1) chat input focus, (2) MutationObserver on tab classes
+            # detected = (iid, pc_id, name) or None
+            detected = None
+
+            # Signal 1: which chat input has OS focus?
+            for iid, info in list(instance_registry.items()):
+                try:
+                    chat = cursor_check_chat_focus(info['ws'])
+                    if chat:
+                        detected = (iid, chat['pc_id'], chat['name'])
+                        break
+                except Exception:
+                    pass
+
+            # Signal 2: MutationObserver — catches tab activation from any UI surface
+            # (tab click, keyboard shortcut, command palette, etc.)
+            if not detected:
+                for iid, info in list(instance_registry.items()):
+                    try:
+                        tab = cursor_poll_tab_observer(info['ws'])
+                        if tab:
+                            detected = (iid, tab['pc_id'], tab['name'])
+                            break
+                    except Exception:
+                        pass
+
+            # Signal 3: poll active editor-group chat (catches Open Editors sidebar clicks
+            # and any other activation path that doesn't trigger class mutations)
+            if not detected:
+                for iid, info in list(instance_registry.items()):
+                    try:
+                        eg_chat = cursor_get_active_editor_chat(info['ws'])
+                        if eg_chat:
+                            detected = (iid, eg_chat['pc_id'], eg_chat['name'])
+                            break
+                    except Exception:
+                        pass
+
+            # Apply active chat change (compare by instance + pc_id, not name)
+            if detected:
+                iid, pc_id, chat_name = detected
+                cur_iid, cur_pc_id = (mirrored_chat[0], mirrored_chat[1]) if mirrored_chat else (None, None)
+                if (iid, pc_id) != (cur_iid, cur_pc_id):
+                    # Different chat — actual switch
+                    mirrored_chat = (iid, pc_id, chat_name)
+                    if iid != active_instance_id:
+                        with cdp_lock:
+                            active_instance_id = iid
+                            ws = instance_registry[iid]['ws']
+                    info = instance_registry.get(iid, {})
+                    ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
+                    print(f"[overview] Active: {chat_name}  in {ws_label}")
+                    if chat_id:
+                        tg_send(chat_id, f"💬 Mirroring chat: {ws_label} / {chat_name}")
+                    try:
+                        active_chat_file.write_text(json.dumps({
+                            'workspace': info.get('workspace'),
+                            'chat_name': chat_name,
+                            'pc_id': pc_id,
+                        }))
+                    except Exception:
+                        pass
+                elif chat_name != mirrored_chat[2]:
+                    # Same chat, name changed — silent rename update
+                    mirrored_chat = (iid, pc_id, chat_name)
+                    try:
+                        active_chat_file.write_text(json.dumps({
+                            'workspace': instance_registry.get(iid, {}).get('workspace'),
+                            'chat_name': chat_name,
+                            'pc_id': pc_id,
+                        }))
+                    except Exception:
+                        pass
+
+            if not do_full_scan:
+                continue
+
+            # Full scan cycle (includes focus check at the end)
+            port = detect_cdp_port()
+            current = cdp_list_instances(port)
+            current_ids = {inst['id'] for inst in current}
+            known_ids = set(instance_registry.keys())
+
+            # Detect new instances (connect outside lock, register under lock)
+            for inst in current:
+                if inst['id'] not in known_ids:
+                    label = inst['workspace'] or '(no workspace)'
+                    try:
+                        conn = websocket.create_connection(inst['ws_url'])
+                        with cdp_lock:
+                            instance_registry[inst['id']] = {
+                                'workspace': inst['workspace'],
+                                'title': inst['title'],
+                                'ws': conn,
+                                'ws_url': inst['ws_url'],
+                                'convs': {},
+                            }
+                        cursor_inject_tab_observer(conn)
+                        print(f"[overview] Opened: {label}  [{inst['id'][:8]}]")
+                        if chat_id:
+                            tg_send(chat_id, f"📂 {label}: Opened")
+                    except Exception as e:
+                        print(f"[overview] Failed to connect to {label}: {e}")
+
+            # Detect closed instances
+            # All registry/ws mutations under cdp_lock so sender/monitor
+            # never see a closed socket or stale registry entry.
+            for iid in known_ids - current_ids:
+                with cdp_lock:
+                    info = instance_registry.pop(iid, None)
+                    if info:
+                        is_active = (iid == active_instance_id)
+                        if is_active and instance_registry:
+                            new_id = next(
+                                (k for k, v in instance_registry.items() if v['workspace']),
+                                next(iter(instance_registry))
+                            )
+                            active_instance_id = new_id
+                            ws = instance_registry[new_id]['ws']
+                        elif is_active:
+                            active_instance_id = None
+                            ws = None
+                # Close the old socket outside the lock (network I/O)
+                if info:
+                    label = info['workspace'] or '(no workspace)'
+                    try:
+                        info['ws'].close()
+                    except Exception:
+                        pass
+                    print(f"[overview] Closed: {label}  [{iid[:8]}]")
+                    if chat_id:
+                        tg_send(chat_id, f"📂 {label}: Closed")
+                    if is_active and active_instance_id:
+                        new_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
+                        print(f"[overview] Active switched to: {new_name}")
+                        if chat_id:
+                            tg_send(chat_id, f"📂 {new_name}: Active")
+
+            # Detect workspace changes (e.g. user picked a workspace in empty instance)
+            for inst in current:
+                if inst['id'] in instance_registry:
+                    old = instance_registry[inst['id']]
+                    if old['workspace'] != inst['workspace'] and inst['workspace']:
+                        with cdp_lock:
+                            old['workspace'] = inst['workspace']
+                            old['title'] = inst['title']
+                        print(f"[overview] Workspace opened: {inst['workspace']}  [{inst['id'][:8]}]")
+                        if chat_id:
+                            tg_send(chat_id, f"📂 {inst['workspace']}: Workspace opened")
+
+            # Scan conversations across all instances
+            for iid, info in list(instance_registry.items()):
+                if not info['workspace']:
+                    continue  # skip instances without a workspace
+                try:
+                    convs = cursor_scan_convs(info['ws'])
+                except Exception:
+                    continue  # WebSocket error, skip this cycle
+
+                current_convs = {c['pc_id']: c for c in convs}
+                known_convs = info['convs']
+                ws_label = info['workspace']
+
+                # New conversations
+                for pc_id, conv in current_convs.items():
+                    if pc_id not in known_convs:
+                        print(f"[overview] New conversation: {conv['name']}  in {ws_label}")
+                        if chat_id:
+                            tg_send(chat_id, f"💬 {ws_label}: New chat — {conv['name']}")
+
+                # Closed conversations
+                for pc_id in set(known_convs) - set(current_convs):
+                    old_name = known_convs[pc_id]['name']
+                    print(f"[overview] Conversation closed: {old_name}  in {ws_label}")
+                    if chat_id:
+                        tg_send(chat_id, f"💬 {ws_label}: Chat closed — {old_name}")
+
+                # Renamed conversations
+                for pc_id, conv in current_convs.items():
+                    if pc_id in known_convs and known_convs[pc_id]['name'] != conv['name']:
+                        old_name = known_convs[pc_id]['name']
+                        print(f"[overview] Conversation renamed: {old_name} → {conv['name']}  in {ws_label}")
+                        if chat_id:
+                            tg_send(chat_id, f"💬 {ws_label}: Chat renamed — {old_name} → {conv['name']}")
+
+                # Update stored conversations (active chat detection handled above)
+                info['convs'] = {pc_id: {'name': c['name'], 'active': c['active']} for pc_id, c in current_convs.items()}
+
+        except Exception as e:
+            print(f"[overview] Error: {e}")
+            time.sleep(5)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 # Single-instance guard: prevent multiple bridge processes
@@ -1453,7 +2157,7 @@ bot = me['result']
 print(f"Bot: @{bot['username']} ({bot['first_name']})")
 
 print("Connecting to Cursor via CDP...")
-ws = cdp_connect()
+cdp_connect()
 print("Connected.")
 
 print(f"\nPocketCursor Bridge v2 running!")
@@ -1468,13 +2172,19 @@ print("Press Ctrl+C to stop.\n")
 
 t1 = threading.Thread(target=sender_thread, daemon=True)
 t2 = threading.Thread(target=monitor_thread, daemon=True)
+t3 = threading.Thread(target=overview_thread, daemon=True)
 t1.start()
 t2.start()
+t3.start()
 
 try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
     print("\nStopping...")
-    ws.close()
+    for info in instance_registry.values():
+        try:
+            info['ws'].close()
+        except Exception:
+            pass
     print("Done.")

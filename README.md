@@ -19,22 +19,26 @@ Not a remote agent. Not a cloud service. YOUR Cursor, accessible from wherever y
 - **Image paste** — send photos from your phone, they get pasted into Cursor's editor
 - **`/screenshot`** — capture your entire Cursor window and view it on your phone
 - **`/pause` & `/play`** — mute forwarding when you're at your desk, resume when you leave
-- **`/agents`** — switch between conversation tabs remotely
+- **`/chats`** — view and switch chats across all Cursor instances, with window activation
+- **Multi-instance awareness** — detects all open Cursor windows, notifies on open/close
+- **Chat notifications** — new chats, closed chats, renames, and active chat changes sent to Telegram
 - **Thinking sections** — AI reasoning forwarded in italic with 💭 prefix
-- **Conversation awareness** — detects tab switches, shows which conversation is active
+- **Auto-follows your focus** — switch chats by clicking tabs, typing in an input, or using `/chats` from your phone — the bridge follows automatically
 - **Owner lock** — auto-pairs with the first user, rejects everyone else
+- **Single-instance guard** — prevents duplicate bridge processes via PID lock file
 - **Works through lock screen** — lock your PC, walk away, keep working from your phone
 
 ## How It Works
 
 PocketCursor uses the Chrome DevTools Protocol (CDP) to talk to Cursor. Cursor is an Electron app (Chromium under the hood), so launching it with a debug port gives full DOM access via WebSocket.
 
-A two-thread Python script does the rest:
+A three-thread Python script does the rest:
 - **Sender thread** — polls Telegram for messages, injects them into Cursor's Lexical editor via CDP
 - **Monitor thread** — watches Cursor's DOM for new AI responses, streams them section-by-section to Telegram
+- **Overview thread** — monitors all Cursor instances and chats, sends notifications on changes
 
 ```
-Phone (Telegram) ←→ pocket_cursor.py ←→ Cursor IDE (CDP)
+Phone (Telegram) ←→ pocket_cursor.py ←→ Cursor IDE (CDP) × N instances
 ```
 
 Everything runs locally on your PC. No server, no cloud, no third-party services (except Telegram's free bot API and optionally OpenAI for voice transcription).
@@ -73,7 +77,7 @@ Then send:
 pause - Mute Cursor → Telegram forwarding
 play - Resume forwarding
 screenshot - Capture Cursor window
-agents - List and switch conversation tabs
+chats - View and switch chats across all Cursor instances
 unpair - Reset owner lock
 ```
 
@@ -104,6 +108,12 @@ python -X utf8 pocket_cursor.py
 
 Send any message to your bot on Telegram — it auto-pairs with the first user.
 
+To restart without losing phone access (useful when Cursor asks for approval):
+
+```bash
+python restart_pocket_cursor.py
+```
+
 ## Commands
 
 | Command | Description |
@@ -111,8 +121,7 @@ Send any message to your bot on Telegram — it auto-pairs with the first user.
 | `/pause` | Mute Cursor → Telegram forwarding (monitor keeps tracking internally) |
 | `/play` | Resume forwarding |
 | `/screenshot` | Capture and send the Cursor window |
-| `/agents` | Show all conversation tabs as clickable buttons |
-| `/agent <name>` | Switch to a conversation by name (substring match) |
+| `/chats` | View and switch chats across all Cursor instances (inline buttons) |
 | `/unpair` | Reset owner lock for re-pairing |
 
 ## Requirements

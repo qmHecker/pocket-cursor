@@ -175,14 +175,19 @@ def find_available_port(exclude=None, quiet=False):
 
 
 def count_page_targets(port):
-    """Count Cursor page targets on a CDP port."""
+    """Count Cursor page targets on a CDP port.
+    
+    Matches on vscode-file:// URL (reliable from first load) with
+    title-based fallback for edge cases.
+    """
     import urllib.request
     import json as _json
     try:
         with urllib.request.urlopen(f'http://localhost:{port}/json', timeout=3) as resp:
             targets = _json.loads(resp.read())
             return sum(1 for t in targets if t.get('type') == 'page'
-                       and 'Cursor' in t.get('title', ''))
+                       and (t.get('url', '').startswith('vscode-file://')
+                            or 'Cursor' in t.get('title', '')))
     except Exception:
         return 0
 

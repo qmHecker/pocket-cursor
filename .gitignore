@@ -6,6 +6,7 @@
 .chat_id
 .bridge.lock
 .muted
+.active_chat
 
 # Local test/scratch scripts
 _test_*.py
