@@ -465,9 +465,16 @@ def cdp_eval_on(conn, expression):
     return result.get('result', {}).get('result', {}).get('value')
 
 
+def active_conn():
+    """Return the WebSocket for the active instance (from registry, not the global ws)."""
+    if active_instance_id and active_instance_id in instance_registry:
+        return instance_registry[active_instance_id]['ws']
+    return ws
+
+
 def cdp_eval(expression):
     """Evaluate JS on the active instance. Thread-safe via cdp_lock."""
-    return cdp_eval_on(ws, expression)
+    return cdp_eval_on(active_conn(), expression)
 
 
 def cdp_bring_to_front(conn):
@@ -522,7 +529,7 @@ def cdp_screenshot_on(conn):
 
 def cdp_screenshot():
     """Capture a screenshot of the active Cursor window. Returns PNG bytes."""
-    return cdp_screenshot_on(ws)
+    return cdp_screenshot_on(active_conn())
 
 
 def cdp_screenshot_element(selector):
@@ -708,7 +715,8 @@ def cursor_send_message(text):
     timestamp = datetime.now().strftime('%a %Y-%m-%d %H:%M')
     text = f"[{timestamp}] [Phone] {text}"
 
-    global ws, msg_id_counter
+    global msg_id_counter
+    conn = active_conn()
     t0 = time.time()
 
     with cdp_lock:
@@ -716,7 +724,7 @@ def cursor_send_message(text):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        ws.send(json.dumps({
+        conn.send(json.dumps({
             'id': mid,
             'method': 'Runtime.evaluate',
             'params': {'expression': """
@@ -735,7 +743,7 @@ def cursor_send_message(text):
                 })();
             """, 'returnByValue': True}
         }))
-        focus_result = json.loads(ws.recv())
+        focus_result = json.loads(conn.recv())
         focus_val = focus_result.get('result', {}).get('result', {}).get('value')
         if focus_val != 'OK':
             return focus_val
@@ -745,19 +753,19 @@ def cursor_send_message(text):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        ws.send(json.dumps({
+        conn.send(json.dumps({
             'id': mid,
             'method': 'Input.insertText',
             'params': {'text': text}
         }))
-        json.loads(ws.recv())
+        json.loads(conn.recv())
         t2 = time.time()
 
         # 3. Verify + click send (still holding lock)
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        ws.send(json.dumps({
+        conn.send(json.dumps({
             'id': mid,
             'method': 'Runtime.evaluate',
             'params': {'expression': """
@@ -787,7 +795,7 @@ def cursor_send_message(text):
                 })();
             """, 'returnByValue': True}
         }))
-        send_result = json.loads(ws.recv())
+        send_result = json.loads(conn.recv())
         result = send_result.get('result', {}).get('result', {}).get('value')
 
     t3 = time.time()
@@ -1652,14 +1660,12 @@ def sender_thread():
 
                 if text == '/screenshot':
                     print(f"[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...")
-                    # Use the active instance's ws directly (not the global ws which may race)
-                    shot_ws = instance_registry[active_instance_id]['ws'] if active_instance_id and active_instance_id in instance_registry else ws
                     try:
-                        cdp_bring_to_front(shot_ws)
+                        cdp_bring_to_front(active_conn())
                     except Exception:
                         pass
                     time.sleep(0.3)
-                    png = cdp_screenshot_on(shot_ws)
+                    png = cdp_screenshot()
                     if png:
                         tg_send_photo_bytes(cid, png, caption="Cursor IDE screenshot")
                         print(f"[sender] Screenshot sent ({len(png)} bytes)")
