@@ -205,6 +205,59 @@ def tg_send_photo_bytes_with_keyboard(cid, photo_bytes, keyboard, filename='scre
         return None
 
 
+POCKET_CURSOR_COMMANDS = [
+    {'command': 'newchat', 'description': 'Start a new chat in Cursor'},
+    {'command': 'chats', 'description': 'Show all chats across instances'},
+    {'command': 'pause', 'description': 'Pause Cursor to Telegram forwarding'},
+    {'command': 'play', 'description': 'Resume forwarding'},
+    {'command': 'screenshot', 'description': 'Screenshot your Cursor window'},
+    {'command': 'unpair', 'description': 'Disconnect this device'},
+]
+
+
+def tg_commands_need_update():
+    """Check if bot commands are missing or outdated compared to POCKET_CURSOR_COMMANDS."""
+    try:
+        existing = tg_call('getMyCommands')
+        current = existing.get('result', []) if existing.get('ok') else []
+        registered = {c['command']: c['description'] for c in current}
+        for cmd in POCKET_CURSOR_COMMANDS:
+            if cmd['command'] not in registered:
+                return True
+            if registered[cmd['command']] != cmd['description']:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def tg_register_commands():
+    """Merge PocketCursor commands into existing bot commands (doesn't overwrite others)."""
+    try:
+        existing = tg_call('getMyCommands')
+        current = existing.get('result', []) if existing.get('ok') else []
+        our_names = {c['command'] for c in POCKET_CURSOR_COMMANDS}
+        merged = [c for c in current if c['command'] not in our_names]
+        merged.extend(POCKET_CURSOR_COMMANDS)
+        result = tg_call('setMyCommands', commands=merged)
+        ok = result.get('ok', False)
+        print(f"[tg] Registered {len(POCKET_CURSOR_COMMANDS)} commands (total {len(merged)}): {'OK' if ok else result}")
+        return ok
+    except Exception as e:
+        print(f"[tg] Failed to register commands: {e}")
+        return False
+
+
+def tg_ask_command_update(cid):
+    """Send an inline keyboard asking the user to update bot commands."""
+    tg_call('sendMessage', chat_id=cid,
+            text="New commands available. Want me to update your Telegram bot menu?",
+            reply_markup={'inline_keyboard': [
+                [{'text': '✅ Yes, update', 'callback_data': 'setup_commands:yes'},
+                 {'text': 'Skip', 'callback_data': 'setup_commands:no'}]
+            ]})
+
+
 def vscode_url_to_path(url):
     """Convert vscode-file://vscode-app/c%3A/Users/... to a local file path."""
     if not url or not url.startswith('vscode-file://'):
@@ -1317,6 +1370,26 @@ def sender_thread():
                         tg_call('answerCallbackQuery', callback_query_id=cb_id)
                         continue
 
+                    if action == 'setup_commands':
+                        if tool_id == 'yes':
+                            ok = tg_register_commands()
+                            tg_call('answerCallbackQuery', callback_query_id=cb_id,
+                                    text='Commands registered!' if ok else 'Failed to register')
+                            # Update the message to remove the buttons
+                            cb_msg = callback.get('message', {})
+                            if cb_msg:
+                                tg_call('editMessageText', chat_id=cb_msg['chat']['id'],
+                                        message_id=cb_msg['message_id'],
+                                        text='✅ Command menu registered.')
+                        else:
+                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Skipped')
+                            cb_msg = callback.get('message', {})
+                            if cb_msg:
+                                tg_call('editMessageText', chat_id=cb_msg['chat']['id'],
+                                        message_id=cb_msg['message_id'],
+                                        text='Command menu skipped. You can always add commands later via /setcommands in @BotFather.')
+                        continue
+
                     if action in ('agent', 'chat'):
                         # New format: chat:{instance_id}:{pc_id}
                         parts = cb_data.split(':', 2)
@@ -1440,12 +1513,18 @@ def sender_thread():
                     # First message from anyone -> auto-pair
                     OWNER_ID = user_id
                     owner_file.write_text(str(user_id))
+                    with chat_id_lock:
+                        chat_id = cid
+                    chat_id_file.write_text(str(cid))
                     print(f"[owner] Auto-paired with {user} (ID: {user_id})")
-                    tg_send(cid, "🔗 Paired! Your messages will now be forwarded to Cursor.\nSend /pause to mute, /play to resume.")
+                    tg_send(cid, "🔗 You're in! Messages flow both ways now.\nUse /pause to mute, /play to resume.")
+                    if tg_commands_need_update():
+                        tg_ask_command_update(cid)
+                    continue
 
                 if status == 'rejected':
                     print(f"[sender] Rejected message from {user} (ID: {user_id})")
-                    tg_send(cid, "This bot is already paired with another user.")
+                    tg_send(cid, "Already paired with someone else.\nIf that's you on another device, send /unpair there first.\n\nWant your own? github.com/qmHecker/pocket-cursor")
                     continue
 
                 # Store chat_id for the monitor thread (and persist for restarts)
@@ -1525,19 +1604,32 @@ def sender_thread():
                 print(f"[sender] {user}: {text}")
 
                 # Handle commands
+                if text == '/start':
+                    conv_name = cursor_get_active_conv()
+                    status_line = "⏸ Paused" if muted else "▶ Active"
+                    instances = len(instance_registry)
+                    lines = [
+                        f"PocketCursor is running. {status_line}",
+                        f"{instances} workspace{'s' if instances != 1 else ''} connected.",
+                    ]
+                    if conv_name:
+                        lines.append(f"💬 {conv_name}")
+                    lines.append("\n/newchat /chats /pause /play /screenshot /unpair")
+                    tg_send(cid, '\n'.join(lines))
+                    continue
+
                 if text == '/unpair':
                     OWNER_ID = None
                     if owner_file.exists():
                         owner_file.unlink()
-                    tg_send(cid, "Unpaired. Bot is now open for a new /start pairing.")
+                    tg_send(cid, "👋 Unpaired. Next message from anyone will pair them.")
                     print(f"[owner] Unpaired")
                     continue
 
                 if text == '/pause':
-                    global muted
                     muted = True
                     muted_file.touch()
-                    tg_send(cid, "⏸ Paused. Cursor messages won't be forwarded.\nSend /play to resume.")
+                    tg_send(cid, "⏸ Paused. Nothing will be forwarded.\nSend /play when you're ready.")
                     print("[sender] Paused")
                     continue
 
@@ -1587,7 +1679,7 @@ def sender_thread():
                         tg_call('sendMessage', chat_id=cid, text=f'📂 {ws_name}',
                                 reply_markup={'inline_keyboard': keyboard})
                     if not any_chats:
-                        tg_send(cid, "No chats found.")
+                        tg_send(cid, "No open chats right now.")
                     continue
 
                 # Record what we're sending (so monitor knows which turn is ours)
@@ -2260,6 +2352,16 @@ if not me.get('ok'):
 bot = me['result']
 print(f"Bot: @{bot['username']} ({bot['first_name']})")
 
+# Set bot description if not already configured (shown to new users above the START button)
+_desc = tg_call('getMyDescription')
+if not _desc.get('result', {}).get('description'):
+    tg_call('setMyDescription',
+            description="Your Cursor IDE, in your pocket.\n\nTap START to pair. Your conversations then flow both ways between Cursor and Telegram.")
+_short = tg_call('getMyShortDescription')
+if not _short.get('result', {}).get('short_description'):
+    tg_call('setMyShortDescription',
+            short_description="Cursor IDE ↔ Telegram bridge")
+
 print("Connecting to Cursor via CDP...")
 cdp_connect()
 print("Connected.")
@@ -2272,6 +2374,12 @@ if chat_id:
     print(f"Chat ID: {chat_id} (restored from previous session)")
 if muted:
     print("Status: PAUSED (restored from previous session)")
+
+# Check if bot commands need updating and ask the user
+if chat_id and tg_commands_need_update():
+    print("[tg] Command menu is outdated, asking user to update...")
+    tg_ask_command_update(chat_id)
+
 print("Press Ctrl+C to stop.\n")
 
 t1 = threading.Thread(target=sender_thread, daemon=True)
