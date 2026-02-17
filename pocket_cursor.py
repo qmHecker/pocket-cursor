@@ -737,6 +737,21 @@ def cursor_send_message(text):
     return result
 
 
+def cursor_new_chat():
+    """Click the '+' button to create a new chat tab. Returns 'OK' or error."""
+    return cdp_eval("""
+        (function() {
+            // Primary: the "New Chat" button in the auxiliary bar title
+            const btn = document.querySelector('[data-command-id="auxiliaryBar.newAgentMenu"] a.codicon-add-two')
+                     || document.querySelector('[data-command-id="composer.createNewComposerTab"] a.codicon-add-two')
+                     || document.querySelector('a[aria-label*="New Chat"]');
+            if (!btn) return 'ERROR: new-chat button not found';
+            btn.click();
+            return 'OK';
+        })();
+    """)
+
+
 def cursor_get_active_conv():
     """Get the name of the active conversation tab."""
     return cdp_eval("""
@@ -1546,6 +1561,14 @@ def sender_thread():
                         print(f"[sender] Screenshot sent ({len(png)} bytes)")
                     else:
                         tg_send(cid, "Failed to capture screenshot.")
+                    continue
+
+                if text == '/newchat':
+                    print("[sender] Creating new chat...")
+                    result = cursor_new_chat()
+                    if not result or not result.startswith('OK'):
+                        tg_send(cid, f"Failed: {result}")
+                    print(f"[sender] New chat: {result}")
                     continue
 
                 if text in ('/chats', '/agents', '/agent'):
