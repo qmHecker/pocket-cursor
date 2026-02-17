@@ -1,88 +1,65 @@
 # PocketCursor
 
-**Your Cursor IDE, in your pocket.**
+**Your Cursor, from your phone. The conversation doesn't have to end.**
 
-The conversation doesn't have to end. PocketCursor bridges your running Cursor IDE to Telegram, so you can keep collaborating with your AI assistant from your phone — same conversation, same files, same context.
+To some people Cursor is "just" an IDE. To others, it's a coworker, a sparring partner, someone you actually think with. When you step away from your computer, those conversations end.
 
-Not a remote agent. Not a cloud service. YOUR Cursor, accessible from wherever you are.
+PocketCursor keeps them going. It connects your running Cursor to Telegram on your phone. Everything mirrors both ways. Not a remote agent. Not a cloud service. YOUR Cursor, wherever you are.
 
-[![Demo video](https://img.youtube.com/vi/hK7GIbRTzYo/maxresdefault.jpg)](https://www.youtube.com/watch?v=hK7GIbRTzYo)
+[▶ Watch the demo video](https://www.youtube.com/watch?v=hK7GIbRTzYo)
 
-## Features
+## What it's like to use
 
-- **Full bidirectional mirroring** — messages flow both ways between Cursor and Telegram, regardless of where you type
-- **Voice messages** — speak into Telegram, get transcription via OpenAI, forwarded to Cursor as text
-- **Section-by-section streaming** — AI responses stream to your phone as they're generated, not as one block when done
-- **Code block screenshots** — syntax-highlighted code arrives as clean screenshots, readable on a phone screen
-- **Table & file edit screenshots** — rich content that doesn't translate to plain text gets screenshotted automatically
-- **Interactive confirmations** — Accept/Reject prompts forwarded as Telegram inline buttons, tap to respond
-- **Image paste** — send photos from your phone, they get pasted into Cursor's editor
-- **`/screenshot`** — capture your entire Cursor window and view it on your phone
-- **`/pause` & `/play`** — mute forwarding when you're at your desk, resume when you leave
-- **`/chats`** — view and switch chats across all Cursor instances, with window activation
-- **Multi-instance awareness** — detects all open Cursor windows, notifies on open/close
-- **Chat notifications** — new chats, closed chats, renames, and active chat changes sent to Telegram
-- **Thinking sections** — AI reasoning forwarded in italic with 💭 prefix
-- **Auto-follows your focus** — switch chats by clicking tabs, typing in an input, or using `/chats` from your phone — the bridge follows automatically
-- **Owner lock** — auto-pairs with the first user, rejects everyone else
-- **Phone outbox** — the AI writes a `.md` file to `_phone_outbox/`, references it with a `[PHONE_OUTBOX:file.md]` marker, and it arrives on your phone as a styled image with optional caption
-- **Single-instance guard** — prevents duplicate bridge processes via PID lock file
-- **Works through lock screen** — lock your PC, walk away, keep working from your phone
+- **Voice messages.** Speak into Telegram. It gets transcribed and forwarded to Cursor.
+- **Streaming responses.** AI responses arrive on your phone section by section, as they're generated. Not one block when done.
+- **Code as screenshots.** Syntax-highlighted code blocks arrive as clean, readable images on your phone.
+- **Interactive confirmations.** When Cursor needs approval, buttons appear on Telegram. Tap to accept or reject.
+- **Images both ways.** Send photos from your phone into Cursor's editor. Images from Cursor arrive on Telegram.
+- **Multi-workspace.** Detects all open Cursor workspaces. Switch between them from your phone via `/chats`.
+- **Auto-follows your focus.** Switch chats on your PC and the bridge follows. Switch from your phone and Cursor follows. Both directions, always in sync.
+- **Works through lock screen.** Lock your PC, walk away, keep going.
 
-## How It Works
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/newchat` | Start a fresh conversation |
+| `/chats` | Show your open chats across all workspaces (tap to switch) |
+| `/pause` | Mute forwarding |
+| `/play` | Resume forwarding |
+| `/screenshot` | Screenshot your Cursor window |
+| `/unpair` | Disconnect this device |
+| `/start` | Show status and commands |
+
+### Under the hood
+
+Also included: tables and file edit diffs as auto-screenshots, AI thinking sections (💭 prefix), chat notifications (new/closed/renamed chats), phone outbox (AI sends styled `.md` files as images), owner lock (auto-pairs with first user), single-instance guard (prevents duplicate processes).
+
+## How it works
 
 PocketCursor uses the Chrome DevTools Protocol (CDP) to talk to Cursor. Cursor is an Electron app (Chromium under the hood), so launching it with a debug port gives full DOM access via WebSocket.
 
 A three-thread Python script does the rest:
-- **Sender thread** — polls Telegram for messages, injects them into Cursor's Lexical editor via CDP
-- **Monitor thread** — watches Cursor's DOM for new AI responses, streams them section-by-section to Telegram
-- **Overview thread** — monitors all Cursor instances and chats, sends notifications on changes
+- **Overview thread** monitors all Cursor instances and chats, sends notifications on changes
+- **Sender thread** polls Telegram for messages, injects them into Cursor's Lexical editor via CDP
+- **Monitor thread** watches Cursor's DOM for new AI responses, streams them to Telegram
 
 ```
-Phone (Telegram) ←→ pocket_cursor.py ←→ Cursor IDE (CDP) × N instances
+Phone (Telegram) ←→ pocket_cursor.py ←→ all open Cursor windows
 ```
 
-Everything runs locally on your PC. No server, no cloud, no third-party services (except Telegram's free bot API and optionally OpenAI for voice transcription).
+Everything runs locally on your machine. No server, no cloud, no middlemen. Just Telegram's free bot API and optionally OpenAI for voice transcription.
 
 ## Setup
 
-### 1. Launch Cursor with CDP enabled
-
-The easiest way — auto-finds Cursor and launches it with the right flags:
-
-```bash
-python start_cursor.py
-```
-
-Or launch manually with these flags:
-
-```
-cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222
-```
-
-> **Tip:** Edit your desktop shortcut to always include these flags so you don't have to remember them.
-
-### 2. Create a Telegram bot
+### 1. Create a Telegram bot
 
 1. Open [@BotFather](https://t.me/BotFather) on Telegram
 2. Send `/newbot`, follow the prompts, copy the bot token
-3. Register the command menu so commands appear in Telegram's UI:
 
-```
-/setcommands
-```
+PocketCursor sets up the bot description and command menu automatically on first pair.
 
-Then send:
-
-```
-pause - Mute Cursor → Telegram forwarding
-play - Resume forwarding
-screenshot - Capture Cursor window
-chats - View and switch chats across all Cursor instances
-unpair - Reset owner lock
-```
-
-### 3. Configure
+### 2. Configure
 
 ```bash
 cp .env.example .env
@@ -95,12 +72,28 @@ TELEGRAM_BOT_TOKEN=your-token-here
 OPENAI_API_KEY=your-key-here
 ```
 
-### 4. Install dependencies
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 npm install
 ```
+
+### 4. Launch Cursor with CDP enabled
+
+Auto-finds Cursor and launches with the right flags:
+
+```bash
+python start_cursor.py
+```
+
+Or launch manually:
+
+```
+cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222
+```
+
+> **Tip:** Edit your desktop shortcut to always include these flags so you don't have to remember them.
 
 ### 5. Run
 
@@ -108,37 +101,26 @@ npm install
 python -X utf8 pocket_cursor.py
 ```
 
-Send any message to your bot on Telegram — it auto-pairs with the first user.
+Send any message to your bot on Telegram. It auto-pairs with the first user.
 
-To restart without losing phone access (useful when Cursor asks for approval):
+If Cursor requires you to confirm command execution, a normal restart (kill + start) would lock you out. The bridge is offline between the two confirmations and you can't confirm the second one. This script kills and restarts in a single command, so you only confirm once:
 
 ```bash
 python restart_pocket_cursor.py
 ```
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `/pause` | Mute Cursor → Telegram forwarding (monitor keeps tracking internally) |
-| `/play` | Resume forwarding |
-| `/screenshot` | Capture and send the Cursor window |
-| `/chats` | View and switch chats across all Cursor instances (inline buttons) |
-| `/unpair` | Reset owner lock for re-pairing |
-
 ## Cursor Rule (optional but recommended)
 
-A [Cursor rule](https://docs.cursor.sh/context/rules-for-ai) is included so the AI knows how to restart the bridge and use the phone outbox without being told every time.
+A [Cursor rule](https://cursor.com/docs/context/rules) is included so the AI knows how to restart the bridge and use the phone outbox without being told every time.
 
 Copy `pocket-cursor.mdc` into your workspace's `.cursor/rules/` folder and replace `<POCKET_CURSOR_DIR>` with the actual path to your PocketCursor installation:
 
 ```bash
-# Example (adjust paths to your setup)
 mkdir -p .cursor/rules
 cp /path/to/pocket-cursor/pocket-cursor.mdc .cursor/rules/
 ```
 
-Then open the copied file and replace all `<POCKET_CURSOR_DIR>` placeholders with the real path, e.g. `C:\Tools\pocket-cursor` or `/home/user/pocket-cursor`.
+Then open the copied file and replace all `<POCKET_CURSOR_DIR>` placeholders with the real path.
 
 ## Requirements
 
@@ -146,8 +128,8 @@ Then open the copied file and replace all `<POCKET_CURSOR_DIR>` placeholders wit
 - **Node.js 18+** (for markdown-to-image rendering via Puppeteer)
 - **Cursor IDE** launched with `--remote-debugging-port=9222`
 - **Telegram bot token** (free, via @BotFather)
-- **OpenAI API key** (optional, for voice message transcription)
+- **OpenAI API key** (optional, for voice transcription)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. Build whatever you want with it.
