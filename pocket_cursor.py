@@ -21,6 +21,8 @@ import base64
 import functools
 import json
 import os
+import re
+import subprocess as sp
 import threading
 import time
 from datetime import datetime
@@ -80,6 +82,7 @@ chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
 muted = muted_file.exists()  # Persisted across restarts
 active_chat_file = Path(__file__).parent / '.active_chat'
+phone_outbox = Path(__file__).parent / '_phone_outbox'
 # Note: no reinit_monitor — monitor tracks continuously even while muted,
 # just skips Telegram sends. This keeps forwarded_ids in sync at all times.
 last_sent_text = None  # Last message sent by the sender thread
@@ -1806,8 +1809,26 @@ def monitor_thread():
                         print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
                         tg_send_thinking(cid, text)
                     else:
-                        print(f"[monitor] Forwarding section {i+1} ({len(text)} chars)")
-                        tg_send(cid, text)
+                        # Check for [PHONE_OUTBOX:filename] marker
+                        outbox_match = OUTBOX_MARKER_RE.search(text)
+                        if outbox_match:
+                            outbox_filename = outbox_match.group(1).strip()
+                            caption = OUTBOX_MARKER_RE.sub('', text).strip()
+                            # Wait up to 15s for the file to appear
+                            outbox_file = phone_outbox / outbox_filename
+                            print(f"[monitor] Outbox marker: waiting for {outbox_filename}")
+                            deadline = time.time() + 15
+                            while not outbox_file.exists() and time.time() < deadline:
+                                time.sleep(1)
+                            if outbox_file.exists():
+                                outbox_render_and_send(outbox_filename, cid, caption=caption)
+                            else:
+                                print(f"[monitor] Outbox file not found after 15s: {outbox_filename}")
+                                if caption:
+                                    tg_send(cid, caption)
+                        else:
+                            print(f"[monitor] Forwarding section {i+1} ({len(text)} chars)")
+                            tg_send(cid, text)
 
                 # Always advance tracking — muted sections are "silently consumed"
                 if sec_key:
@@ -2103,6 +2124,65 @@ def overview_thread():
             print(f"[overview] Error: {e}")
             time.sleep(5)
 
+
+# ── Phone outbox renderer ─────────────────────────────────────────────────────
+
+MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
+OUTBOX_MARKER_RE = re.compile(r'\[PHONE_OUTBOX:([^\]]+)\]')
+phone_outbox.mkdir(exist_ok=True)
+
+
+def outbox_render_and_send(filename, cid, caption=None):
+    """Render an outbox file and send it to Telegram. Returns True on success.
+    
+    Width convention: 'name.w800.md' → render at 800px. Default 450px.
+    """
+    f = phone_outbox / filename
+    if not f.is_file():
+        return False
+
+    ext = f.suffix.lower()
+    png_bytes = None
+
+    if ext == '.md':
+        # Parse optional width from filename: name.w800.md → 800
+        width_match = re.search(r'\.w(\d+)\.md$', f.name, re.IGNORECASE)
+        width_args = ['--width', width_match.group(1)] if width_match else []
+
+        png_path = f.with_suffix('.png')
+        try:
+            result = sp.run(
+                ['node', str(MD_TO_IMAGE_SCRIPT), str(f), '--out', str(png_path)] + width_args,
+                capture_output=True, text=True, encoding='utf-8',
+                errors='replace', timeout=60
+            )
+            if result.returncode != 0:
+                print(f"[outbox] Render failed: {result.stderr.strip()}")
+                return False
+            png_bytes = png_path.read_bytes()
+        except Exception as e:
+            print(f"[outbox] Render error: {e}")
+            return False
+        finally:
+            try:
+                f.unlink(missing_ok=True)
+                png_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
+        try:
+            png_bytes = f.read_bytes()
+            f.unlink()
+        except Exception as e:
+            print(f"[outbox] Read error: {e}")
+            return False
+
+    if png_bytes:
+        tg_send_photo_bytes(cid, png_bytes, filename=f'{f.stem}.png', caption=caption)
+        print(f"[outbox] Sent {filename} ({len(png_bytes)} bytes)" + (f" with caption ({len(caption)} chars)" if caption else ""))
+        return True
+    return False
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 

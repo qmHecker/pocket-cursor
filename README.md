@@ -25,6 +25,7 @@ Not a remote agent. Not a cloud service. YOUR Cursor, accessible from wherever y
 - **Thinking sections** — AI reasoning forwarded in italic with 💭 prefix
 - **Auto-follows your focus** — switch chats by clicking tabs, typing in an input, or using `/chats` from your phone — the bridge follows automatically
 - **Owner lock** — auto-pairs with the first user, rejects everyone else
+- **Phone outbox** — the AI writes a `.md` file to `_phone_outbox/`, references it with a `[PHONE_OUTBOX:file.md]` marker, and it arrives on your phone as a styled image with optional caption
 - **Single-instance guard** — prevents duplicate bridge processes via PID lock file
 - **Works through lock screen** — lock your PC, walk away, keep working from your phone
 
@@ -98,6 +99,7 @@ OPENAI_API_KEY=your-key-here
 
 ```bash
 pip install -r requirements.txt
+npm install
 ```
 
 ### 5. Run
@@ -124,9 +126,24 @@ python restart_pocket_cursor.py
 | `/chats` | View and switch chats across all Cursor instances (inline buttons) |
 | `/unpair` | Reset owner lock for re-pairing |
 
+## Cursor Rule (optional but recommended)
+
+A [Cursor rule](https://docs.cursor.sh/context/rules-for-ai) is included so the AI knows how to restart the bridge and use the phone outbox without being told every time.
+
+Copy `pocket-cursor.mdc` into your workspace's `.cursor/rules/` folder and replace `<POCKET_CURSOR_DIR>` with the actual path to your PocketCursor installation:
+
+```bash
+# Example (adjust paths to your setup)
+mkdir -p .cursor/rules
+cp /path/to/pocket-cursor/pocket-cursor.mdc .cursor/rules/
+```
+
+Then open the copied file and replace all `<POCKET_CURSOR_DIR>` placeholders with the real path, e.g. `C:\Tools\pocket-cursor` or `/home/user/pocket-cursor`.
+
 ## Requirements
 
 - **Python 3.10+**
+- **Node.js 18+** (for markdown-to-image rendering via Puppeteer)
 - **Cursor IDE** launched with `--remote-debugging-port=9222`
 - **Telegram bot token** (free, via @BotFather)
 - **OpenAI API key** (optional, for voice message transcription)

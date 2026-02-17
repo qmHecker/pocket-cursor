@@ -1,0 +1,16 @@
+{
+  "name": "pocket-cursor",
+  "version": "1.0.0",
+  "description": "**Your Cursor IDE, in your pocket.**",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "marked": "^17.0.2",
+    "puppeteer": "^24.37.3"
+  }
+}

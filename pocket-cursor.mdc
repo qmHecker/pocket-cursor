@@ -1,0 +1,19 @@
+---
+description: PocketCursor — Telegram bridge for Cursor IDE
+alwaysApply: true
+---
+
+## PocketCursor bridge ("restart", "restart bridge", "restart pocket cursor")
+
+- **Script:** `<POCKET_CURSOR_DIR>/restart_pocket_cursor.py`
+- **Run:** `python "<POCKET_CURSOR_DIR>/restart_pocket_cursor.py"` with `block_until_ms: 0` (long-running process).
+- **Auto-restart:** When editing any file under `<POCKET_CURSOR_DIR>`, always restart the bridge after changes that affect runtime behavior (bug fixes, features, refactors). Do not wait for the user to ask.
+- If the user reports unexpected behavior, check if a restart is needed first.
+
+## Phone outbox ("send to phone", "phone outbox")
+
+- **Folder:** `<POCKET_CURSOR_DIR>/_phone_outbox/`
+- **Example:** `<POCKET_CURSOR_DIR>/_phone_outbox/_EXAMPLE.md`
+- Write a `.md` file there, then include `[PHONE_OUTBOX:filename.md]` in your response to send it as a styled image to the user's phone.
+- **Caption:** Text in the same message as the marker becomes the image caption — sent as **one** Telegram message (photo + text). Put the marker and caption text together without tool calls or blank lines between them, e.g.: `Here's the summary [PHONE_OUTBOX:filename.md]`
+- Image width via filename convention: `filename.w800.md` → 800px wide. Default is 450px (phone portrait).

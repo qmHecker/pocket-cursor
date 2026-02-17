@@ -8,9 +8,17 @@
 .muted
 .active_chat
 
+# Phone outbox (transient files sent to Telegram)
+_phone_outbox/
+!_phone_outbox/_EXAMPLE.md
+
 # Local test/scratch scripts
 _test_*.py
 .commitmsg
+
+# Node.js (md_to_image.mjs dependencies)
+node_modules/
+package-lock.json
 
 # Python
 __pycache__/
