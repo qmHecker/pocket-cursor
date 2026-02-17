@@ -503,21 +503,26 @@ def cdp_insert_text(text):
         json.loads(ws.recv())
 
 
-def cdp_screenshot():
-    """Capture a screenshot of the Cursor window via CDP. Returns PNG bytes."""
-    global ws, msg_id_counter
+def cdp_screenshot_on(conn):
+    """Capture a screenshot via CDP on a specific connection. Returns PNG bytes."""
+    global msg_id_counter
     with msg_id_lock:
         msg_id_counter += 1
         mid = msg_id_counter
     with cdp_lock:
-        ws.send(json.dumps({
+        conn.send(json.dumps({
             'id': mid,
             'method': 'Page.captureScreenshot',
             'params': {'format': 'png'}
         }))
-        result = json.loads(ws.recv())
+        result = json.loads(conn.recv())
     b64 = result.get('result', {}).get('data')
     return base64.b64decode(b64) if b64 else None
+
+
+def cdp_screenshot():
+    """Capture a screenshot of the active Cursor window. Returns PNG bytes."""
+    return cdp_screenshot_on(ws)
 
 
 def cdp_screenshot_element(selector):
@@ -1646,8 +1651,15 @@ def sender_thread():
                     continue
 
                 if text == '/screenshot':
-                    print("[sender] Taking screenshot...")
-                    png = cdp_screenshot()
+                    print(f"[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...")
+                    # Use the active instance's ws directly (not the global ws which may race)
+                    shot_ws = instance_registry[active_instance_id]['ws'] if active_instance_id and active_instance_id in instance_registry else ws
+                    try:
+                        cdp_bring_to_front(shot_ws)
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                    png = cdp_screenshot_on(shot_ws)
                     if png:
                         tg_send_photo_bytes(cid, png, caption="Cursor IDE screenshot")
                         print(f"[sender] Screenshot sent ({len(png)} bytes)")
@@ -2099,7 +2111,7 @@ def overview_thread():
                     info = instance_registry.get(iid, {})
                     ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
                     print(f"[overview] Active: {chat_name}  in {ws_label}")
-                    if chat_id:
+                    if chat_id and not muted:
                         tg_send(chat_id, f"💬 Mirroring chat: {ws_label} / {chat_name}")
                     try:
                         active_chat_file.write_text(json.dumps({
@@ -2146,7 +2158,7 @@ def overview_thread():
                             }
                         cursor_inject_tab_observer(conn)
                         print(f"[overview] Opened: {label}  [{inst['id'][:8]}]")
-                        if chat_id:
+                        if chat_id and not muted:
                             tg_send(chat_id, f"📂 {label}: Opened")
                     except Exception as e:
                         print(f"[overview] Failed to connect to {label}: {e}")
@@ -2177,12 +2189,12 @@ def overview_thread():
                     except Exception:
                         pass
                     print(f"[overview] Closed: {label}  [{iid[:8]}]")
-                    if chat_id:
+                    if chat_id and not muted:
                         tg_send(chat_id, f"📂 {label}: Closed")
                     if is_active and active_instance_id:
                         new_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
                         print(f"[overview] Active switched to: {new_name}")
-                        if chat_id:
+                        if chat_id and not muted:
                             tg_send(chat_id, f"📂 {new_name}: Active")
 
             # Detect workspace changes (e.g. user picked a workspace in empty instance)
@@ -2194,7 +2206,7 @@ def overview_thread():
                             old['workspace'] = inst['workspace']
                             old['title'] = inst['title']
                         print(f"[overview] Workspace opened: {inst['workspace']}  [{inst['id'][:8]}]")
-                        if chat_id:
+                        if chat_id and not muted:
                             tg_send(chat_id, f"📂 {inst['workspace']}: Workspace opened")
 
             # Scan conversations across all instances
@@ -2214,14 +2226,14 @@ def overview_thread():
                 for pc_id, conv in current_convs.items():
                     if pc_id not in known_convs:
                         print(f"[overview] New conversation: {conv['name']}  in {ws_label}")
-                        if chat_id:
+                        if chat_id and not muted:
                             tg_send(chat_id, f"💬 {ws_label}: New chat — {conv['name']}")
 
                 # Closed conversations
                 for pc_id in set(known_convs) - set(current_convs):
                     old_name = known_convs[pc_id]['name']
                     print(f"[overview] Conversation closed: {old_name}  in {ws_label}")
-                    if chat_id:
+                    if chat_id and not muted:
                         tg_send(chat_id, f"💬 {ws_label}: Chat closed — {old_name}")
 
                 # Renamed conversations
@@ -2229,7 +2241,7 @@ def overview_thread():
                     if pc_id in known_convs and known_convs[pc_id]['name'] != conv['name']:
                         old_name = known_convs[pc_id]['name']
                         print(f"[overview] Conversation renamed: {old_name} → {conv['name']}  in {ws_label}")
-                        if chat_id:
+                        if chat_id and not muted:
                             tg_send(chat_id, f"💬 {ws_label}: Chat renamed — {old_name} → {conv['name']}")
 
                 # Update stored conversations (active chat detection handled above)
