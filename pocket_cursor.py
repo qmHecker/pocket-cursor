@@ -88,7 +88,7 @@ phone_outbox = Path(__file__).parent / '_phone_outbox'
 last_sent_text = None  # Last message sent by the sender thread
 last_sent_lock = threading.Lock()
 last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
-pending_confirms = {}  # {tool_call_id: {accept_selector, reject_selector}} for inline keyboards
+pending_confirms = {}  # {tool_call_id: {buttons_selector, buttons: [{label, index}]}} for inline keyboards
 pending_confirms_lock = threading.Lock()
 
 
@@ -1172,26 +1172,54 @@ def cursor_get_turn_info():
                 if (kind === 'tool') {
                     const toolStatus = msg.getAttribute('data-tool-status');
                     const toolCallId = msg.getAttribute('data-tool-call-id') || '';
-                    const acceptBtn = msg.querySelector('.composer-run-button');
-                    const rejectBtn = msg.querySelector('.composer-skip-button');
+                    // Pending confirmation: find ALL action buttons in the status row
+                    const statusRow = msg.querySelector('.composer-tool-call-status-row');
+                    const actionBtns = statusRow ? statusRow.querySelectorAll('[data-click-ready="true"]') : [];
 
-                    // Pending confirmation (action buttons visible)
-                    if (toolStatus === 'loading' && acceptBtn) {
-                        // Read actual button labels from the DOM
-                        const acceptLabel = acceptBtn ? acceptBtn.innerText.trim().replace(/\\s+/g, ' ') : 'Accept';
-                        const rejectLabel = rejectBtn ? rejectBtn.innerText.trim().replace(/\\s+/g, ' ') : 'Skip';
+                    if (toolStatus === 'loading' && actionBtns.length > 0) {
+                        // Collect all buttons universally (labels + indices)
+                        const buttons = Array.from(actionBtns).map((btn, idx) => ({
+                            label: btn.innerText.trim().replace(/\\s+/g, ' '),
+                            index: idx
+                        }));
+
                         const desc = msg.querySelector('.composer-tool-former-message');
                         // Extract text from specific DOM parts, ignoring control row (buttons)
+                        // and Monaco diff editors (whose innerText changes async and breaks stability).
                         let cleanText = 'Action pending';
                         if (desc) {
                             const parts = [];
+                            // File edit confirmation: filename + line stats + block status
+                            const filename = desc.querySelector('.composer-code-block-filename');
+                            if (filename) {
+                                parts.push(filename.textContent.trim());
+                                const fileStat = desc.querySelector('.composer-code-block-status');
+                                if (fileStat) parts.push(fileStat.textContent.trim());
+                                const blockPill = desc.querySelector('.block-attribution-pill-label');
+                                if (blockPill) parts.push(blockPill.textContent.trim());
+                            }
+                            // Tool call confirmation: headers + body
                             const topHeader = desc.querySelector('.composer-tool-call-top-header');
                             const header = desc.querySelector('.composer-tool-call-header');
                             const body = desc.querySelector('.composer-tool-call-body');
                             if (topHeader) parts.push(topHeader.innerText.trim().replace(/\\s+/g, ' '));
                             if (header) parts.push(header.innerText.trim().replace(/\\s+/g, ' '));
                             if (body && body.innerText.trim()) parts.push(body.innerText.trim());
-                            cleanText = parts.filter(Boolean).join('\\n') || desc.innerText.trim();
+                            if (!parts.length) {
+                                // Fallback: clone desc, strip status row (buttons),
+                                // walk text nodes and join with spaces (innerText
+                                // doesn't insert spaces between flex items).
+                                const clone = desc.cloneNode(true);
+                                const sr = clone.querySelector('.composer-tool-call-status-row');
+                                if (sr) sr.remove();
+                                const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+                                let node;
+                                while (node = walker.nextNode()) {
+                                    const t = node.textContent.trim();
+                                    if (t) parts.push(t);
+                                }
+                            }
+                            cleanText = parts.join(' ') || 'Action pending';
                         }
                         const bubbleSelector = '#bubble-' + bubbleSuffix;
                         sections.push({
@@ -1199,10 +1227,8 @@ def cursor_get_turn_info():
                             type: 'confirmation',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
                             selector: bubbleSelector + ' .composer-tool-former-message > div',
-                            accept_selector: bubbleSelector + ' .composer-run-button',
-                            reject_selector: bubbleSelector + ' .composer-skip-button',
-                            accept_label: acceptLabel,
-                            reject_label: rejectLabel
+                            buttons_selector: bubbleSelector + ' .composer-tool-call-status-row [data-click-ready="true"]',
+                            buttons: buttons
                         });
                         return;
                     }
@@ -1478,25 +1504,26 @@ def sender_thread():
                             else:
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
                             print(f"[sender] Agent switch: {result}")
-                    elif selectors and action in ('accept', 'reject'):
-                        btn_selector = selectors['accept'] if action == 'accept' else selectors['reject']
-                        print(f"[sender] Callback: {action} tool {tool_id[:12]}...")
-                        # Click the button in Cursor
+                    elif selectors and action.startswith('btn_'):
+                        # Universal button click: action = "btn_INDEX"
+                        try:
+                            btn_index = int(action.split('_', 1)[1])
+                        except (ValueError, IndexError):
+                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid button')
+                            continue
+                        btns_selector = selectors.get('buttons_selector', '')
+                        btn_label = next((b['label'] for b in selectors.get('buttons', []) if b['index'] == btn_index), f'Button {btn_index}')
+                        print(f"[sender] Callback: click button [{btn_index}] '{btn_label}' for tool {tool_id[:12]}...")
                         click_result = cdp_eval(f"""
                             (function() {{
-                                const btn = document.querySelector('{btn_selector}');
-                                if (!btn) return 'ERROR: button not found';
-                                btn.click();
+                                const btns = document.querySelectorAll('{btns_selector}');
+                                if (!btns[{btn_index}]) return 'ERROR: button ' + {btn_index} + ' not found (' + btns.length + ' buttons)';
+                                btns[{btn_index}].click();
                                 return 'OK';
                             }})();
                         """)
                         print(f"[sender] Click result: {click_result}")
-                        # Answer the callback to remove loading spinner
-                        # Use the button text the user tapped (from the inline keyboard)
-                        btn_text = callback.get('message', {}).get('reply_markup', {}).get(
-                            'inline_keyboard', [[]])[0]
-                        tapped = next((b['text'] for b in btn_text if b.get('callback_data', '').startswith(action)), None)
-                        tg_call('answerCallbackQuery', callback_query_id=cb_id, text=tapped or action.capitalize())
+                        tg_call('answerCallbackQuery', callback_query_id=cb_id, text=btn_label)
                     else:
                         tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Expired')
                     continue
@@ -1891,24 +1918,24 @@ def monitor_thread():
                                 forwarded_ids.add(sec_key)
                             section_stable.pop(sec_key, None)
                             continue
-                    accept_sel = sec.get('accept_selector', '')
-                    reject_sel = sec.get('reject_selector', '')
+                    buttons = sec.get('buttons', [])
+                    btns_selector = sec.get('buttons_selector', '')
                     with pending_confirms_lock:
                         pending_confirms[tool_id] = {
-                            'accept': accept_sel,
-                            'reject': reject_sel
+                            'buttons_selector': btns_selector,
+                            'buttons': buttons
                         }
                     if not muted:
                         tg_typing(cid)
                         png = None
                         if sec_selector:
                             png = cdp_screenshot_element(sec_selector)
-                        accept_label = sec.get('accept_label', 'Accept')
-                        reject_label = sec.get('reject_label', 'Skip')
-                        keyboard = [[
-                            {'text': f'✅ {accept_label}', 'callback_data': f'accept:{tool_id}'},
-                            {'text': f'❌ {reject_label}', 'callback_data': f'reject:{tool_id}'}
-                        ]]
+                        keyboard = []
+                        for btn in buttons:
+                            keyboard.append([{
+                                'text': btn['label'],
+                                'callback_data': f"btn_{btn['index']}:{tool_id}"
+                            }])
                         if png:
                             print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
                             tg_send_photo_bytes_with_keyboard(cid, png, keyboard,
