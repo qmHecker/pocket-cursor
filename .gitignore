@@ -16,6 +16,9 @@ _phone_outbox/
 _test_*.py
 .commitmsg
 
+# Internal docs (plans, reviews, notes)
+_*.md
+
 # Node.js (md_to_image.mjs dependencies)
 node_modules/
 package-lock.json
