@@ -13,11 +13,11 @@ _phone_outbox/
 !_phone_outbox/_EXAMPLE.md
 
 # Local test/scratch scripts
-_test_*.py
+tests/
 .commitmsg
 
 # Internal docs (plans, reviews, notes)
-_*.md
+docs/
 
 # Node.js (md_to_image.mjs dependencies)
 node_modules/

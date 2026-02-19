@@ -18,7 +18,6 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
 # Standard library
 import atexit
 import base64
-import functools
 import json
 import os
 import re
@@ -31,7 +30,7 @@ from urllib.parse import unquote, urlparse
 
 # Sibling modules
 from start_cursor import get_used_ports
-from chat_detection import install_chat_listener, start_chat_listener, list_chats
+from chat_detection import install_chat_listener, start_chat_listener, list_chats, ts_print
 
 # Third-party
 import requests
@@ -39,7 +38,7 @@ import websocket
 from openai import OpenAI
 from PIL import Image
 
-print = functools.partial(print, flush=True)
+print = ts_print
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -74,6 +73,7 @@ chat_id_file = Path(__file__).parent / '.chat_id'
 # Shared state
 cdp_lock = threading.Lock()
 ws = None                    # Active instance's WebSocket (all cdp_* functions use this)
+_browser_ws_url = None       # Browser-level WebSocket URL (cached at connect time)
 instance_registry = {}       # {target_id: {workspace, ws, ws_url, title}}
 active_instance_id = None    # Which instance ws points to
 mirrored_chat = None         # (instance_id, pc_id, chat_name) — the ONE chat being mirrored
@@ -97,7 +97,12 @@ pending_confirms_lock = threading.Lock()
 
 def tg_call(method, **params):
     resp = requests.post(f"{TG_API}/{method}", json=params, timeout=60)
-    return resp.json()
+    result = resp.json()
+    if not result.get('ok'):
+        desc = result.get('description', '?')
+        code = result.get('error_code', '?')
+        print(f"[telegram] API error: {method} -> {code} {desc}")
+    return result
 
 
 def tg_typing(cid):
@@ -150,9 +155,9 @@ def tg_send_thinking(cid, text):
         result = tg_call('sendMessage', chat_id=cid, text=msg, parse_mode='MarkdownV2')
         if result.get('ok'):
             return result
-        print(f"[tg] MarkdownV2 failed: {result.get('description', '?')}, falling back to plain text")
+        print(f"[telegram] MarkdownV2 failed: {result.get('description', '?')}, falling back to plain text")
     except Exception as e:
-        print(f"[tg] MarkdownV2 error: {e}, falling back to plain text")
+        print(f"[telegram] MarkdownV2 error: {e}, falling back to plain text")
     # Fallback: plain text with prefix
     return tg_call('sendMessage', chat_id=cid, text=f"💭 {text}")
 
@@ -167,9 +172,14 @@ def tg_send_photo(cid, photo_path, caption=None):
             if caption:
                 data['caption'] = caption[:1024]  # Telegram caption limit
             resp = requests.post(f"{TG_API}/sendPhoto", data=data, files={'photo': f}, timeout=30)
-            return resp.json()
+            result = resp.json()
+            if not result.get('ok'):
+                desc = result.get('description', '?')
+                code = result.get('error_code', '?')
+                print(f"[telegram] sendPhoto failed: {code} {desc}  ({photo_path})")
+            return result
     except Exception as e:
-        print(f"[tg] sendPhoto error: {e}")
+        print(f"[telegram] sendPhoto error: {e}")
         return None
 
 
@@ -183,9 +193,14 @@ def tg_send_photo_bytes(cid, photo_bytes, filename='screenshot.png', caption=Non
             data['caption'] = caption[:1024]
         resp = requests.post(f"{TG_API}/sendPhoto", data=data,
                              files={'photo': (filename, photo_bytes, 'image/png')}, timeout=30)
-        return resp.json()
+        result = resp.json()
+        if not result.get('ok'):
+            desc = result.get('description', '?')
+            code = result.get('error_code', '?')
+            print(f"[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)")
+        return result
     except Exception as e:
-        print(f"[tg] sendPhoto bytes error: {e}")
+        print(f"[telegram] sendPhoto bytes error: {e}")
         return None
 
 
@@ -200,9 +215,14 @@ def tg_send_photo_bytes_with_keyboard(cid, photo_bytes, keyboard, filename='scre
         data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
         resp = requests.post(f"{TG_API}/sendPhoto", data=data,
                              files={'photo': (filename, photo_bytes, 'image/png')}, timeout=30)
-        return resp.json()
+        result = resp.json()
+        if not result.get('ok'):
+            desc = result.get('description', '?')
+            code = result.get('error_code', '?')
+            print(f"[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)")
+        return result
     except Exception as e:
-        print(f"[tg] sendPhoto+keyboard error: {e}")
+        print(f"[telegram] sendPhoto+keyboard error: {e}")
         return None
 
 
@@ -242,10 +262,10 @@ def tg_register_commands():
         merged.extend(POCKET_CURSOR_COMMANDS)
         result = tg_call('setMyCommands', commands=merged)
         ok = result.get('ok', False)
-        print(f"[tg] Registered {len(POCKET_CURSOR_COMMANDS)} commands (total {len(merged)}): {'OK' if ok else result}")
+        print(f"[telegram] Registered {len(POCKET_CURSOR_COMMANDS)} commands (total {len(merged)}): {'OK' if ok else result}")
         return ok
     except Exception as e:
-        print(f"[tg] Failed to register commands: {e}")
+        print(f"[telegram] Failed to register commands: {e}")
         return False
 
 
@@ -394,6 +414,11 @@ def _handle_chat_switch(iid, data):
     ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
     is_provisional = pc_id.startswith('pc-')
     print(f"[dom] Active: {name}  in {ws_label}" + (" (provisional)" if is_provisional else ""))
+    # Seed the overview's known_convs so it can detect renames.
+    # Without this, a new chat created and auto-renamed before the next
+    # overview scan would never be seen under its original name ("New Chat").
+    if not is_provisional and 'convs' in info and pc_id not in info['convs']:
+        info['convs'][pc_id] = {'name': name, 'active': True, 'msg_id': None}
     if chat_id and not muted and not is_provisional and not same_chat_new_window:
         with _switch_debounce_lock:
             if _switch_debounce_timer:
@@ -447,6 +472,16 @@ def _handle_chat_rename(iid, data):
             pass
 
 
+def _on_listener_dead(label, exc):
+    """Called when a chat listener thread dies. Flags the instance for reconnect."""
+    for iid, info in instance_registry.items():
+        ws_label = info.get('workspace') or '(no workspace)'
+        if ws_label == label or label == ws_label:
+            info['listener_dead'] = True
+            print(f"[overview] Listener dead for {label}, will reconnect on next scan")
+            return
+
+
 def _setup_chat_listener(iid, ws_url, label):
     """Open a dedicated listener WebSocket and start the chat listener thread."""
     listener_conn = websocket.create_connection(ws_url)
@@ -455,15 +490,22 @@ def _setup_chat_listener(iid, ws_url, label):
         listener_conn, label,
         on_switch=lambda data: _handle_chat_switch(iid, data),
         on_rename=lambda data: _handle_chat_rename(iid, data),
+        on_dead=_on_listener_dead,
     )
     return listener_conn
 
 
 def cdp_connect():
-    """Connect to all Cursor instances. Sets ws to the first instance with a workspace."""
-    global ws, instance_registry, active_instance_id, mirrored_chat
+    """Connect to all Cursor instances. Restores the last active chat from .active_chat, or defaults to the first instance with a workspace."""
+    global ws, instance_registry, active_instance_id, mirrored_chat, _browser_ws_url
     port = detect_cdp_port()
     print(f"[cdp] Using port {port}")
+    try:
+        binfo = requests.get(f'http://localhost:{port}/json/version', timeout=3).json()
+        _browser_ws_url = binfo.get('webSocketDebuggerUrl')
+        print(f"[cdp] Browser WS: {_browser_ws_url}")
+    except Exception:
+        _browser_ws_url = None
     instances = cdp_list_instances(port)
 
     if not instances:
@@ -495,7 +537,7 @@ def cdp_connect():
     for iid, info in instance_registry.items():
         if info['workspace']:
             try:
-                convs = list_chats(info['ws'])
+                convs = list_chats(lambda js, c=info['ws']: cdp_eval_on(c, js))
                 info['convs'] = {c['pc_id']: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')} for c in convs}
                 names = [c['name'] for c in convs]
                 print(f"[cdp] Conversations in {info['workspace']}: {names}")
@@ -567,22 +609,113 @@ def cdp_eval(expression):
     return cdp_eval_on(active_conn(), expression)
 
 
-def cdp_bring_to_front(conn):
-    """Bring a Cursor window to the foreground via CDP Page.bringToFront.
-    
-    Uses the existing WebSocket connection — no window title matching needed.
-    Cross-platform: works on Windows, macOS, and Linux.
-    """
+def _cdp_cmd(conn, method, params=None):
+    """Send a CDP command and return the result. Thread-safe."""
     global msg_id_counter
     with msg_id_lock:
         msg_id_counter += 1
         mid = msg_id_counter
+    msg = {'id': mid, 'method': method}
+    if params:
+        msg['params'] = params
     with cdp_lock:
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Page.bringToFront',
-        }))
-        conn.recv()
+        conn.send(json.dumps(msg))
+        return json.loads(conn.recv())
+
+
+def _win32_force_foreground(title):
+    """Bypass Windows focus-stealing prevention.
+
+    Primary: SetWindowPos with HWND_TOPMOST (no flicker, z-order trick).
+    Fallback: minimize/restore (flickers but always works).
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+    user32 = ctypes.windll.user32
+
+    hwnd = user32.FindWindowW(None, title)
+    if not hwnd:
+        print(f"[cdp] bring_to_front: FindWindowW no match for '{title[:50]}'")
+        return False
+
+    # Properly typed HWND values — critical on 64-bit Windows where
+    # HWND is a pointer (c_void_p). Without argtypes, ctypes truncates
+    # -1 to 32-bit c_int which SetWindowPos silently ignores.
+    user32.SetWindowPos.argtypes = [
+        wt.HWND, wt.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = wt.BOOL
+
+    SWP = 0x0002 | 0x0001 | 0x0040  # NOMOVE | NOSIZE | SHOWWINDOW
+    TOPMOST = wt.HWND(-1)
+    NOTOPMOST = wt.HWND(-2)
+
+    r1 = user32.SetWindowPos(hwnd, TOPMOST, 0, 0, 0, 0, SWP)
+    r2 = user32.SetWindowPos(hwnd, NOTOPMOST, 0, 0, 0, 0, SWP)
+    user32.SetForegroundWindow(hwnd)
+
+    if r1 and r2:
+        print(f"[cdp] bring_to_front: SetWindowPos OK  hwnd={hwnd}  title='{title[:50]}'")
+        return True
+
+    # Fallback: minimize/restore (causes brief flicker but guaranteed)
+    print(f"[cdp] bring_to_front: SetWindowPos failed ({r1},{r2}), trying minimize/restore")
+    user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+    time.sleep(0.05)
+    user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    print(f"[cdp] bring_to_front: minimize/restore  hwnd={hwnd}")
+    return True
+
+
+def cdp_bring_to_front(conn, target_id=None):
+    """Bring a Cursor window to the foreground.
+
+    Three-stage strategy:
+      1. CDP Page.bringToFront + window.focus() (works when OS allows it)
+      2. Target.activateTarget on browser-level WS (activates the tab in Chrome)
+      3. OS-specific: Win32 SetWindowPos | macOS osascript | Linux xdotool
+    """
+    print(f"[cdp] bring_to_front: Page.bringToFront + window.focus()  target={target_id}")
+    _cdp_cmd(conn, 'Page.bringToFront')
+    cdp_eval_on(conn, 'window.focus()')
+
+    if target_id and _browser_ws_url:
+        try:
+            browser_conn = websocket.create_connection(_browser_ws_url)
+            try:
+                browser_conn.send(json.dumps({
+                    'id': 1, 'method': 'Target.activateTarget',
+                    'params': {'targetId': target_id}
+                }))
+                result = json.loads(browser_conn.recv())
+                if result.get('error'):
+                    print(f"[cdp] bring_to_front: Target.activateTarget FAILED: {result['error']}")
+                else:
+                    print(f"[cdp] bring_to_front: Target.activateTarget OK  target={target_id[:8]}")
+            finally:
+                browser_conn.close()
+        except Exception as e:
+            print(f"[cdp] bring_to_front: Target.activateTarget exception: {e}")
+
+    try:
+        title = cdp_eval_on(conn, 'document.title')
+        if not title:
+            print(f"[cdp] bring_to_front: document.title was empty")
+        elif sys.platform == 'win32':
+            _win32_force_foreground(title)
+        elif sys.platform == 'darwin':
+            sp.Popen(['osascript', '-e', 'tell application "Cursor" to activate'],
+                      stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            print(f"[cdp] bring_to_front: osascript activate")
+        elif sys.platform.startswith('linux'):
+            sp.Popen(['xdotool', 'search', '--name', title, 'windowactivate'],
+                      stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            print(f"[cdp] bring_to_front: xdotool windowactivate")
+    except Exception as e:
+        print(f"[cdp] bring_to_front: OS fallback exception: {e}")
 
 
 def cdp_insert_text(text):
@@ -699,6 +832,18 @@ def cdp_screenshot_element(selector):
     print(f"[screenshot] Crop: {img_w}x{img_h} @ {scale_x:.1f}x -> ({left},{top})-({right},{bottom})")
 
     cropped = img.crop((left, top, right, bottom))
+
+    # Telegram rejects photos under ~100px on shortest side (PHOTO_INVALID_DIMENSIONS).
+    # Pad small crops with the background color from the bottom-right pixel.
+    MIN_DIM = 100
+    cw, ch = cropped.size
+    if cw < MIN_DIM or ch < MIN_DIM:
+        new_w = max(cw, MIN_DIM)
+        new_h = max(ch, MIN_DIM)
+        bg = cropped.getpixel((cw - 1, ch - 1))
+        padded = Image.new(cropped.mode, (new_w, new_h), bg)
+        padded.paste(cropped, ((new_w - cw) // 2, (new_h - ch) // 2))
+        cropped = padded
 
     # Export as PNG bytes
     buf = io.BytesIO()
@@ -1157,6 +1302,7 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     if (child.classList.contains('markdown-section')) {
                         // Code blocks live inside markdown-section but should be screenshotted
                         const codeBlock = child.querySelector('.markdown-block-code');
+                        const latexBlock = child.querySelector('.markdown-block-latex');
                         if (codeBlock) {
                             const text = child.innerText.trim();
                             // Use the section's unique DOM id for a reliable selector
@@ -1167,6 +1313,30 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             sections.push({
                                 text: text,
                                 type: 'code_block',
+                                id: child.id || ('gen:' + msgId + ':' + subIdx),
+                                selector: selector
+                            });
+                            subIdx++;
+                        } else if (latexBlock) {
+                            const text = child.innerText.trim();
+                            const selector = child.id
+                                ? '#' + child.id + ' .markdown-block-latex'
+                                : '#bubble-' + bubbleSuffix + ' .markdown-block-latex';
+                            sections.push({
+                                text: text,
+                                type: 'latex',
+                                id: child.id || ('gen:' + msgId + ':' + subIdx),
+                                selector: selector
+                            });
+                            subIdx++;
+                        } else if (child.querySelector('.markdown-inline-latex')) {
+                            const text = child.innerText.trim();
+                            const selector = child.id
+                                ? '#' + child.id
+                                : '#bubble-' + bubbleSuffix;
+                            sections.push({
+                                text: text,
+                                type: 'latex',
                                 id: child.id || ('gen:' + msgId + ':' + subIdx),
                                 selector: selector
                             });
@@ -1336,7 +1506,7 @@ def sender_thread():
                                     print(f"[sender] Switched instance to: {info['workspace']}")
                                     # Bring the target Cursor window to the foreground via CDP
                                     try:
-                                        cdp_bring_to_front(info['ws'])
+                                        cdp_bring_to_front(info['ws'], target_iid)
                                     except Exception as e:
                                         print(f"[sender] Could not bring window to front: {e}")
                                 # Update mirrored_chat immediately (don't wait for overview thread)
@@ -1344,8 +1514,6 @@ def sender_thread():
                                 mirrored_chat = (target_iid, target_pc_id, chat_name)
                                 ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
-                                if chat_id:
-                                    tg_send(chat_id, f"💬 Chat activated: {chat_name}  ({ws_label})")
                                 try:
                                     active_chat_file.write_text(json.dumps({
                                         'workspace': info.get('workspace'),
@@ -1552,7 +1720,7 @@ def sender_thread():
                 if text == '/screenshot':
                     print(f"[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...")
                     try:
-                        cdp_bring_to_front(active_conn())
+                        cdp_bring_to_front(active_conn(), active_instance_id)
                     except Exception:
                         pass
                     time.sleep(0.3)
@@ -1903,7 +2071,7 @@ def monitor_thread():
                 elif not muted:
                     # Only send to Telegram when not muted
                     tg_typing(cid)
-                    if sec_type in ('table', 'file_edit', 'code_block'):
+                    if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
                         png = None
                         if sec_selector:
                             png = cdp_screenshot_element(sec_selector)
@@ -1911,7 +2079,7 @@ def monitor_thread():
                             png = cdp_screenshot_element(
                                 '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
                             )
-                        label = {'table': 'TABLE', 'file_edit': 'FILE_EDIT', 'code_block': 'CODE_BLOCK'}[sec_type]
+                        label = {'table': 'TABLE', 'file_edit': 'FILE_EDIT', 'code_block': 'CODE_BLOCK', 'latex': 'LATEX'}[sec_type]
                         if png:
                             print(f"[monitor] Forwarding section {i+1} as {label} screenshot ({len(png)} bytes)")
                             caption = f"📝 {text}" if sec_type == 'file_edit' else ''
@@ -1976,12 +2144,13 @@ def monitor_thread():
 #
 # Active chat detection is event-driven via chat_detection.py:
 # click/focusin events → JS detectChat() → __pc_report binding → Python callback.
-# See _active_chat_detection_plan.md for full design.
+# See docs/active-chat-detection-plan.md for full design.
 #
 # This thread handles instance lifecycle (new/closed/workspace changes)
 # and periodic conversation scans (new/closed/renamed chats).
 
 SCAN_INTERVAL = 3     # seconds between full rescans
+SCAN_VERBOSE = False  # True = log every chat per scan (fingerprint details)
 
 def overview_thread():
     """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
@@ -2081,30 +2250,44 @@ def overview_thread():
                         if chat_id and not muted:
                             tg_send(chat_id, f"📂 Workspace opened: {inst['workspace']}")
 
-            # Scan conversations — one scan per workspace to avoid duplicates
-            # from multiple CDP targets pointing at the same window.
-            # Detached windows are separate sockets and tracked independently by
-            # the monitor; the overview treats per-socket close/open as ground truth.
-            scanned_workspaces = set()
+            # Reconnect dead listeners
+            for iid, info in list(instance_registry.items()):
+                if info.get('listener_dead'):
+                    label = info.get('workspace') or '(no workspace)'
+                    try:
+                        old_ws = info.get('listener_ws')
+                        if old_ws:
+                            try:
+                                old_ws.close()
+                            except Exception:
+                                pass
+                        listener_conn = _setup_chat_listener(iid, info['ws_url'], label)
+                        info['listener_ws'] = listener_conn
+                        info.pop('listener_dead', None)
+                        print(f"[overview] Listener reconnected: {label}")
+                    except Exception as e:
+                        print(f"[overview] Listener reconnect failed for {label}: {e}")
+
+            # Scan conversations per instance. Each CDP target gets its own scan
+            # because detached windows have distinct DOMs despite sharing a workspace name.
+            scan_summary = {}
             for iid, info in list(instance_registry.items()):
                 ws_name = info['workspace']
                 if not ws_name:
                     continue
-                if ws_name in scanned_workspaces:
-                    continue
                 try:
-                    convs = list_chats(info['ws'])
+                    convs = list_chats(lambda js, c=info['ws']: cdp_eval_on(c, js))
                 except Exception:
                     continue
-                scanned_workspaces.add(ws_name)
 
                 current_convs = {c['pc_id']: c for c in convs}
                 known_convs = info['convs']
                 ws_label = ws_name.removesuffix(' (Workspace)')
-                for c in convs:
-                    mid = c.get('msg_id', '-')
-                    mid_short = mid[:12] if mid and mid != '-' else '-'
-                    print(f"[overview] scan: {c['pc_id']}  msg={mid_short:14s}  \"{c['name']}\"  in {ws_label}")
+                if SCAN_VERBOSE:
+                    for c in convs:
+                        mid = c.get('msg_id', '-')
+                        mid_short = mid[:12] if mid and mid != '-' else '-'
+                        print(f"[overview] fingerprint: {c['pc_id']}  msg={mid_short:14s}  \"{c['name']}\"  in {ws_label}")
 
                 # Fingerprint-scoring: match disappeared↔appeared entries
                 disappeared = set(known_convs) - set(current_convs)
@@ -2169,6 +2352,11 @@ def overview_thread():
                             tg_send(chat_id, f"💬 Chat renamed: {old_name} → {conv['name']}  ({ws_label})")
 
                 info['convs'] = {pc_id: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')} for pc_id, c in current_convs.items()}
+                scan_summary[ws_label] = scan_summary.get(ws_label, 0) + len(convs)
+
+            if scan_summary:
+                parts = '  '.join(f"{ws} ({n})" for ws, n in scan_summary.items())
+                print(f"[overview] chat scan: {parts}")
 
         except Exception as e:
             print(f"[overview] Error: {e}")
@@ -2312,7 +2500,7 @@ if muted:
 
 # Check if bot commands need updating and ask the user
 if chat_id and tg_commands_need_update():
-    print("[tg] Command menu is outdated, asking user to update...")
+    print("[telegram] Command menu is outdated, asking user to update...")
     tg_ask_command_update(chat_id)
 
 print("Press Ctrl+C to stop.\n")

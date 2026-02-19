@@ -10,8 +10,16 @@ Exports:
 
 See _active_chat_detection_plan.md for design rationale and DOM analysis.
 """
-import json, threading, functools
-print = functools.partial(print, flush=True)
+import json, threading, builtins
+from datetime import datetime
+
+
+def ts_print(*args, **kwargs):
+    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    kwargs.setdefault('flush', True)
+    builtins.print(f"[{ts}]", *args, **kwargs)
+
+print = ts_print
 
 # ── CDP helpers (per-connection, no global state) ─────────────────────────────
 
@@ -353,11 +361,12 @@ def install_chat_listener(ws_conn):
     return result
 
 
-def start_chat_listener(ws_conn, label, on_switch, on_rename=None):
+def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None):
     """Start a daemon thread that listens for chat switch/rename events.
 
     Logs ALL events for debugging (like _test_composer_focus.py).
     Only triggers callbacks for actual switches and renames.
+    on_dead(label, exception) is called when the listener thread exits.
     """
     def _listener():
         try:
@@ -399,21 +408,25 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None):
                     pass
         except Exception as e:
             print(f"[dom] Listener ended: {label} ({e})")
+            if on_dead:
+                on_dead(label, e)
 
     t = threading.Thread(target=_listener, name=f'chat-listener-{label}', daemon=True)
     t.start()
     return t
 
 
-def list_chats(ws_conn):
+def list_chats(eval_fn):
     """List all open chats on a Cursor instance.
 
+    eval_fn: callable(js_string) -> value, e.g. lambda js: cdp_eval_on(conn, js).
     Returns list of dicts: [{pc_id, name, active, msg_id?}].
     msg_id is the last human message UUID (stable conversation fingerprint).
     """
-    result = _cdp_eval(ws_conn, _LIST_CHATS_JS)
+    result = eval_fn(_LIST_CHATS_JS)
     try:
         parsed = json.loads(result) if result else []
-    except (json.JSONDecodeError, TypeError):
-        return []
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"[chat_detection] list_chats parse error: {e}")
+        raise
     return parsed if isinstance(parsed, list) else []
