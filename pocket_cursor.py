@@ -2108,7 +2108,15 @@ def monitor_thread():
                 if not initialized:
                     print(f"[monitor] Init: '{user_full[:50]}', skipping {len(sections)} existing")
                     if not muted and conv:
-                        tg_send(cid, f"💬 Connected: {conv}")
+                        mc = mirrored_chat
+                        ws_label = ''
+                        if mc:
+                            info = instance_registry.get(mc[0], {})
+                            ws_label = (info.get('workspace') or '').removesuffix(' (Workspace)')
+                        if ws_label:
+                            tg_send(cid, f"\U0001f4ac Chat activated: {conv}  ({ws_label})")
+                        else:
+                            tg_send(cid, f"\U0001f4ac Chat activated: {conv}")
                     forwarded_ids = {
                         sec.get('id', '') for sec in sections
                         if isinstance(sec, dict) and sec.get('id')

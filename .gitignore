@@ -9,6 +9,10 @@
 .active_chat
 .context_pcts
 
+# Journals (personal to each conversation, except example)
+.pocket-cursor/journals/*
+!.pocket-cursor/journals/2026-02-20-communication-review.md
+
 # Phone outbox (transient files sent to Telegram)
 _phone_outbox/
 !_phone_outbox/_EXAMPLE.md

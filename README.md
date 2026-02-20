@@ -12,8 +12,8 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 - **Voice messages.** Speak into Telegram. It gets transcribed and forwarded to Cursor.
 - **Streaming responses.** AI responses arrive on your phone section by section, as they're generated. Not one block when done.
-- **Code as screenshots.** Syntax-highlighted code blocks arrive as clean, readable images on your phone.
-- **Interactive confirmations.** When Cursor needs approval, buttons appear on Telegram. Tap to accept or reject.
+- **Rich content as images.** Code blocks, LaTeX formulas, tables, and file diffs arrive as clean screenshots on your phone.
+- **Interactive confirmations.** When Cursor needs approval, the action buttons appear on Telegram. One tap.
 - **Images both ways.** Send photos from your phone into Cursor's editor. Images from Cursor arrive on Telegram.
 - **Multi-workspace.** Detects all open Cursor workspaces. Switch between them from your phone via `/chats`.
 - **Auto-follows your focus.** Switch chats on your PC and the bridge follows. Switch from your phone and Cursor follows. Both directions, always in sync.
@@ -33,16 +33,18 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 ### Under the hood
 
-Also included: tables and file edit diffs as auto-screenshots, AI thinking sections (💭 prefix), chat notifications (new/closed/renamed chats), phone outbox (AI sends styled `.md` files as images), owner lock (auto-pairs with first user), single-instance guard (prevents duplicate processes).
+Also included: AI thinking sections (💭 prefix), chat notifications (new/closed/renamed chats), phone outbox (AI sends styled `.md` files as images), silent mode (AI can suppress forwarding for housekeeping), owner lock (auto-pairs with first user), single-instance guard (prevents duplicate processes).
 
 ## How it works
 
 PocketCursor uses the Chrome DevTools Protocol (CDP) to talk to Cursor. Cursor is an Electron app (Chromium under the hood), so launching it with a debug port gives full DOM access via WebSocket.
 
-A three-thread Python script does the rest:
-- **Overview thread** monitors all Cursor instances and chats, sends notifications on changes
+A Python script with three main threads does the rest:
 - **Sender thread** polls Telegram for messages, injects them into Cursor's Lexical editor via CDP
 - **Monitor thread** watches Cursor's DOM for new AI responses, streams them to Telegram
+- **Overview thread** tracks Cursor instances and conversations (open, close, rename)
+
+Each Cursor window also gets a lightweight event listener that detects chat switches instantly via DOM events — no polling.
 
 ```
 Phone (Telegram) ←→ pocket_cursor.py ←→ all open Cursor windows
@@ -113,7 +115,7 @@ python restart_pocket_cursor.py
 
 PocketCursor can monitor your context window fill level and remind the AI to save its working memory before a summary compresses it.
 
-When enabled, it prefills an annotation like `[ContextMonitor: 85% context used -- journal reminder]` directly into the chat input field after each AI response. The annotation rides with the user's next message — no extra LLM roundtrip, no separate turn. The AI decides what to do with the reminder — it might write a journal entry at `.pocket-cursor/journals/`, or it might not. The journal is the AI's personal memory space.
+When enabled, it prefills an annotation like `[ContextMonitor: 85% context used -- journal reminder (see pocket-cursor.mdc § Context monitor)]` directly into the chat input field after each AI response. The annotation rides with the user's next message — no extra LLM roundtrip, no separate turn. The AI decides what to do with the reminder (the Cursor rule tells it how). It might write a journal entry at `.pocket-cursor/journals/`, or it might not. The journal is the AI's personal memory space.
 
 To enable, add to your `.env`:
 

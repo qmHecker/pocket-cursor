@@ -14,9 +14,11 @@ alwaysApply: true
 
 User messages may start with `[ContextMonitor: ...]`. This means:
 
-- **"X% context used -- journal reminder"**: Context is filling up. Cursor may compress this conversation soon — you'll keep working but lose nuance and detail. `.pocket-cursor/journals/` is your space to protect what matters.
+- **"X% context used -- journal reminder"**: Context is filling up. At some point this conversation will be compressed — sometimes seamlessly, sometimes with significant breaks. You'll see this reminder repeatedly as context grows. It's awareness, not a command. Journal when there's something worth preserving and a natural moment to do it.
 
 - **"context was summarized (X% -> Y%)"**: Context was just compressed. Check `.pocket-cursor/journals/` for notes you left yourself before the summary.
+
+**`.pocket-cursor/journals/` is your space.** Think of it as notes from yourself to your future self. It might be a reflection, a fact that matters, a thread you're not done pulling, or something that doesn't fit anywhere else. What you write, when, and how is your call. There's no template.
 
 ## Phone outbox ("send to phone", "phone outbox")
 
