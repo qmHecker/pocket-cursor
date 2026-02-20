@@ -10,6 +10,14 @@ alwaysApply: true
 - **Auto-restart:** When editing any file under `<POCKET_CURSOR_DIR>`, always restart the bridge after changes that affect runtime behavior (bug fixes, features, refactors). Do not wait for the user to ask.
 - If the user reports unexpected behavior, check if a restart is needed first.
 
+## Context monitor (requires `CONTEXT_MONITOR=true` in `.env`)
+
+User messages may start with `[ContextMonitor: ...]`. This means:
+
+- **"X% context used -- journal reminder"**: Context is filling up. Cursor may compress this conversation soon — you'll keep working but lose nuance and detail. `.pocket-cursor/journals/` is your space to protect what matters.
+
+- **"context was summarized (X% -> Y%)"**: Context was just compressed. Check `.pocket-cursor/journals/` for notes you left yourself before the summary.
+
 ## Phone outbox ("send to phone", "phone outbox")
 
 - **Folder:** `<POCKET_CURSOR_DIR>/_phone_outbox/`

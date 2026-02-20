@@ -7,6 +7,7 @@
 .bridge.lock
 .muted
 .active_chat
+.context_pcts
 
 # Phone outbox (transient files sent to Telegram)
 _phone_outbox/

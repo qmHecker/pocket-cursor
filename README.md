@@ -109,6 +109,20 @@ If Cursor requires you to confirm command execution, a normal restart (kill + st
 python restart_pocket_cursor.py
 ```
 
+## Context Monitor (optional)
+
+PocketCursor can monitor your context window fill level and remind the AI to save its working memory before a summary compresses it.
+
+When enabled, it prefills an annotation like `[ContextMonitor: 85% context used -- journal reminder]` directly into the chat input field after each AI response. The annotation rides with the user's next message — no extra LLM roundtrip, no separate turn. The AI decides what to do with the reminder — it might write a journal entry at `.pocket-cursor/journals/`, or it might not. The journal is the AI's personal memory space.
+
+To enable, add to your `.env`:
+
+```
+CONTEXT_MONITOR=true
+```
+
+You also need the context monitor section in your Cursor rule (included in `pocket-cursor.mdc`) so the AI knows how to interpret the annotations.
+
 ## Cursor Rule (optional but recommended)
 
 A [Cursor rule](https://cursor.com/docs/context/rules) is included so the AI knows how to restart the bridge and use the phone outbox without being told every time.

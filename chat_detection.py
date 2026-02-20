@@ -379,6 +379,13 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None)
                     continue
                 try:
                     ev = json.loads(msg['params']['payload'])
+
+                    if ev.get('type') == 'context':
+                        pct_val = ev.get('pct', '?')
+                        action = ev.get('action', '?')
+                        print(f"[context] {pct_val}% -- {action}  [{label}]")
+                        continue
+
                     tag = ev.get('tag', '?')
                     cls = ev.get('cls', '')
                     text = ev.get('text', '')

@@ -63,6 +63,9 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY not set. Voice messages won't be transcribed.")
 
+# Context journal: prefill annotation into chat input when context window is filling up
+CONTEXT_MONITOR = os.environ.get('CONTEXT_MONITOR', '').lower() in ('true', '1', 'yes')
+
 # Owner lock: only respond to this Telegram user ID
 # Set in .env or auto-captured on first /start command
 OWNER_ID = os.environ.get('TELEGRAM_OWNER_ID')
@@ -83,6 +86,7 @@ chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
 muted = muted_file.exists()  # Persisted across restarts
 active_chat_file = Path(__file__).parent / '.active_chat'
+context_pcts_file = Path(__file__).parent / '.context_pcts'
 phone_outbox = Path(__file__).parent / '_phone_outbox'
 # Note: no reinit_monitor — monitor tracks continuously even while muted,
 # just skips Telegram sends. This keeps forwarded_ids in sync at all times.
@@ -91,6 +95,18 @@ last_sent_lock = threading.Lock()
 last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
 pending_confirms = {}  # {tool_call_id: {buttons_selector, buttons: [{label, index}]}} for inline keyboards
 pending_confirms_lock = threading.Lock()
+
+
+def _save_active_chat(workspace, chat_name, pc_id):
+    """Persist active chat state."""
+    try:
+        active_chat_file.write_text(json.dumps({
+            'workspace': workspace,
+            'chat_name': chat_name,
+            'pc_id': pc_id,
+        }))
+    except Exception:
+        pass
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
@@ -442,14 +458,12 @@ def _handle_chat_switch(iid, data):
 
             _switch_debounce_timer = threading.Timer(1.5, _fire)
             _switch_debounce_timer.start()
-    try:
-        active_chat_file.write_text(json.dumps({
-            'workspace': info.get('workspace'),
-            'chat_name': name,
-            'pc_id': pc_id,
-        }))
-    except Exception:
-        pass
+    _save_active_chat(info.get('workspace'), name, pc_id)
+    if CONTEXT_MONITOR:
+        try:
+            cursor_clear_input()
+        except Exception:
+            pass
 
 
 def _handle_chat_rename(iid, data):
@@ -461,15 +475,11 @@ def _handle_chat_rename(iid, data):
         return
     if mirrored_chat and mirrored_chat[0] == iid and mirrored_chat[1] == pc_id:
         mirrored_chat = (iid, pc_id, name)
-        try:
-            info = instance_registry.get(iid, {})
-            active_chat_file.write_text(json.dumps({
-                'workspace': info.get('workspace'),
-                'chat_name': name,
-                'pc_id': pc_id,
-            }))
-        except Exception:
-            pass
+        info = instance_registry.get(iid, {})
+        _save_active_chat(info.get('workspace'), name, pc_id)
+    if CONTEXT_MONITOR and pc_id in _context_pct_names:
+        _context_pct_names[pc_id] = name
+        _save_context_pcts(pc_id=pc_id, chat_name=name)
 
 
 def _on_listener_dead(label, exc):
@@ -493,6 +503,46 @@ def _setup_chat_listener(iid, ws_url, label):
         on_dead=_on_listener_dead,
     )
     return listener_conn
+
+
+# ── Context Journal Monitor ──────────────────────────────────────────────────
+# Reads the context window fill level from the SVG token ring in Cursor's DOM.
+# The monitor thread sends a follow-up annotation message when the threshold
+# is crossed or a summary is detected.
+
+_CONTEXT_PCT_JS = """
+(function() {
+    var c = document.querySelector('.token-ring-progress');
+    if (!c) return null;
+    var total = parseFloat(c.getAttribute('stroke-dasharray'));
+    var off = parseFloat(c.getAttribute('stroke-dashoffset'));
+    if (!total || isNaN(off)) return null;
+    return Math.round((1 - off / total) * 1000) / 10;
+})()
+"""
+
+
+def get_context_pct(conn=None):
+    """Read the context window fill % from the active Cursor instance."""
+    try:
+        result = cdp_eval_on(conn, _CONTEXT_PCT_JS) if conn else cdp_eval(_CONTEXT_PCT_JS)
+        return float(result) if result is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_context_annotation(ctx, pc_id):
+    """Build the annotation string, or None if no annotation needed."""
+    if ctx is None:
+        return None
+    prev = _context_pcts.get(pc_id)
+    hint = "(see pocket-cursor.mdc § Context monitor)"
+    if prev is not None and prev - ctx > 5:
+        return (f"[ContextMonitor: context was summarized "
+                f"({int(prev)}% -> {int(ctx)}%) -- check your journal {hint}]")
+    if ctx >= CONTEXT_MONITOR_THRESHOLD:
+        return f"[ContextMonitor: {int(ctx)}% context used -- journal reminder {hint}]"
+    return None
 
 
 def cdp_connect():
@@ -942,13 +992,140 @@ def cursor_click_send():
     """)
 
 
-def cursor_send_message(text):
+_CONTEXT_PCTS_MAX = 200
+
+_context_pct_names = {}  # {pc_id: str} — chat names from .context_pcts
+
+def _load_context_pcts():
+    """Load per-chat context % and names from disk."""
+    global _context_pct_names
+    if not context_pcts_file.exists():
+        return {}
+    try:
+        data = json.loads(context_pcts_file.read_text())
+        _context_pct_names = {k: v['name'] for k, v in data.items() if isinstance(v, dict) and 'name' in v}
+        return {k: v['pct'] for k, v in data.items() if isinstance(v, dict) and 'pct' in v}
+    except Exception:
+        return {}
+
+def _save_context_pcts(pc_id=None, chat_name=None):
+    """Persist per-chat context % to disk, pruning to most recent entries."""
+    try:
+        existing = {}
+        if context_pcts_file.exists():
+            existing = json.loads(context_pcts_file.read_text())
+        for pid, pct in _context_pcts.items():
+            entry = existing.get(pid, {})
+            entry['pct'] = pct
+            entry['ts'] = datetime.now().isoformat()
+            if pid == pc_id and chat_name:
+                entry['name'] = chat_name
+            existing[pid] = entry
+        if len(existing) > _CONTEXT_PCTS_MAX:
+            sorted_entries = sorted(existing.items(), key=lambda x: x[1].get('ts', ''), reverse=True)
+            existing = dict(sorted_entries[:_CONTEXT_PCTS_MAX])
+        context_pcts_file.write_text(json.dumps(existing, indent=2))
+    except Exception:
+        pass
+
+if CONTEXT_MONITOR:
+    _context_pcts = _load_context_pcts()
+    if _context_pcts:
+        print(f"[context-monitor] Restored {len(_context_pcts)} chat(s) from .context_pcts")
+else:
+    _context_pcts = {}
+
+
+def cursor_prefill_input(text, conn=None):
+    """Focus the input editor and insert text WITHOUT sending.
+    Used to pre-fill the annotation so it rides with the user's next message.
+    """
+    global msg_id_counter
+    c = conn or active_conn()
+    with cdp_lock:
+        with msg_id_lock:
+            msg_id_counter += 1
+            mid = msg_id_counter
+        c.send(json.dumps({
+            'id': mid,
+            'method': 'Runtime.evaluate',
+            'params': {'expression': """
+                (function() {
+                    let editor = document.querySelector('.aislash-editor-input');
+                    if (!editor) {
+                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
+                        for (const ed of all) {
+                            if (ed.contentEditable === 'true') { editor = ed; break; }
+                        }
+                    }
+                    if (!editor) return 'ERROR: no input editor found';
+                    editor.focus();
+                    editor.click();
+                    return 'OK';
+                })();
+            """, 'returnByValue': True}
+        }))
+        focus_result = json.loads(c.recv())
+        focus_val = focus_result.get('result', {}).get('result', {}).get('value')
+        if focus_val != 'OK':
+            return focus_val
+
+        with msg_id_lock:
+            msg_id_counter += 1
+            mid = msg_id_counter
+        c.send(json.dumps({
+            'id': mid,
+            'method': 'Input.insertText',
+            'params': {'text': text + '\n'}
+        }))
+        json.loads(c.recv())
+        return 'OK'
+
+
+def cursor_clear_input(conn=None):
+    """Focus the chat input editor, select all, and delete via execCommand."""
+    global msg_id_counter
+    c = conn or active_conn()
+    with cdp_lock:
+        with msg_id_lock:
+            msg_id_counter += 1
+            mid = msg_id_counter
+        c.send(json.dumps({
+            'id': mid,
+            'method': 'Runtime.evaluate',
+            'params': {'expression': """
+                (function() {
+                    let editor = document.querySelector('.aislash-editor-input');
+                    if (!editor) {
+                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
+                        for (const ed of all) {
+                            if (ed.contentEditable === 'true') { editor = ed; break; }
+                        }
+                    }
+                    if (!editor) return 'NO_EDITOR';
+                    if (!editor.textContent.trim()) return 'EMPTY';
+                    editor.focus();
+                    const sel = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(editor);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    document.execCommand('delete');
+                    return 'CLEARED';
+                })();
+            """, 'returnByValue': True}
+        }))
+        json.loads(c.recv())
+
+
+def cursor_send_message(text, raw=False):
     """Focus the input editor, insert text, click send.
     Holds the CDP lock for the entire sequence to avoid monitor thread contention.
-    Auto-prepends [Phone] [Day YYYY-MM-DD HH:MM] to every message.
+    Auto-prepends [Phone] [Day YYYY-MM-DD HH:MM] unless raw=True.
     """
-    timestamp = datetime.now().strftime('%a %Y-%m-%d %H:%M')
-    text = f"[{timestamp}] [Phone] {text}"
+    if not raw:
+        timestamp = datetime.now().strftime('%a %Y-%m-%d %H:%M')
+        text = f"[{timestamp}] [Phone] {text}"
 
     global msg_id_counter
     conn = active_conn()
@@ -973,7 +1150,13 @@ def cursor_send_message(text):
                     }
                     if (!editor) return 'ERROR: no input editor found';
                     editor.focus();
-                    editor.click();
+                    // Move cursor to end so new text appends after any prefilled annotation
+                    const sel = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(editor);
+                    range.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
                     return 'OK';
                 })();
             """, 'returnByValue': True}
@@ -984,7 +1167,7 @@ def cursor_send_message(text):
             return focus_val
         t1 = time.time()
 
-        # 2. Insert text (still holding lock)
+        # 2. Insert text at end (still holding lock)
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
@@ -1203,8 +1386,7 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                                 parts.push(filename.textContent.trim());
                                 const fileStat = desc.querySelector('.composer-code-block-status');
                                 if (fileStat) parts.push(fileStat.textContent.trim());
-                                const blockPill = desc.querySelector('.block-attribution-pill-label');
-                                if (blockPill) parts.push(blockPill.textContent.trim());
+                                // Skip block-attribution-pill (Cursor's "Blocked" dropdown — not useful in Telegram)
                             }
                             // Tool call confirmation: headers + body
                             const topHeader = desc.querySelector('.composer-tool-call-top-header');
@@ -1240,6 +1422,11 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                         });
                         return;
                     }
+
+                    // Still loading but no buttons yet — don't classify as
+                    // file_edit or the ID will be burned before confirmation
+                    // buttons appear (race condition).
+                    if (toolStatus === 'loading') return;
 
                     // Completed file edit (code block with diff)
                     const codeBlock = msg.querySelector('.composer-code-block-container');
@@ -1514,14 +1701,7 @@ def sender_thread():
                                 mirrored_chat = (target_iid, target_pc_id, chat_name)
                                 ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
-                                try:
-                                    active_chat_file.write_text(json.dumps({
-                                        'workspace': info.get('workspace'),
-                                        'chat_name': chat_name,
-                                        'pc_id': target_pc_id,
-                                    }))
-                                except Exception:
-                                    pass
+                                _save_active_chat(info.get('workspace'), chat_name, target_pc_id)
                             print(f"[sender] Agent switch: {result}")
                         else:
                             # Legacy format: agent:{index}
@@ -1908,6 +2088,13 @@ def monitor_thread():
                               for sec in sections if isinstance(sec, dict) and sec.get('id')}
                 section_stable = {}
                 marked_done = False
+                if CONTEXT_MONITOR and cur_pcid:
+                    ctx = get_context_pct(mc_conn)
+                    if ctx is not None:
+                        _context_pcts[cur_pcid] = ctx
+                        _context_pct_names[cur_pcid] = cur_name
+                        _save_context_pcts(pc_id=cur_pcid, chat_name=cur_name)
+                        print(f"[context-monitor] Switch: {ctx}% in '{cur_name}'")
                 last_turn_id = turn_id
                 last_conv = conv
                 last_mc_pcid = cur_pcid
@@ -1966,6 +2153,33 @@ def monitor_thread():
                     if isinstance(sec, dict):
                         print(f"  [{idx}] {sec.get('type', '?'):12s}  id={short_id(sec.get('id'))}")
 
+                if CONTEXT_MONITOR and mirrored_chat:
+                    cur_pcid = mirrored_chat[1]
+                    prev_pct = _context_pcts.get(cur_pcid)
+                    ctx = get_context_pct(mc_conn)
+                    ann = _build_context_annotation(ctx, cur_pcid)
+                    if ctx is not None:
+                        _context_pcts[cur_pcid] = ctx
+                        chat_label = mirrored_chat[2] if mirrored_chat else cur_pcid
+                        _context_pct_names[cur_pcid] = chat_label
+                        _save_context_pcts(pc_id=cur_pcid, chat_name=chat_label)
+                        lines = [f"[context-monitor] {ctx}% used in '{chat_label}'"]
+                        for pid, pct in _context_pcts.items():
+                            name = _context_pct_names.get(pid, pid)
+                            if pid == cur_pcid:
+                                delta = ctx - prev_pct if prev_pct is not None else 0
+                                trend = " 📈" if delta > 0 else " 📉" if delta < 0 else ""
+                                lines.append(f"  {name}: {pct:.1f}%{trend}")
+                            else:
+                                lines.append(f"  {name}: {pct:.1f}%")
+                        print('\n'.join(lines))
+                    if ann:
+                        try:
+                            cursor_prefill_input(ann, conn=mc_conn)
+                            print(f"[context-monitor] Prefilled: {ann}")
+                        except Exception as e:
+                            print(f"[context-monitor] Failed to prefill: {e}")
+
                 if not from_telegram:
                     if not muted and user_full:
                         tg_send(cid, f"[PC] {user_full}")
@@ -2000,6 +2214,22 @@ def monitor_thread():
                     sid = sec['id']
                     if sid not in prev_by_id and sid not in forwarded_ids:
                         print(f"[monitor] + New bubble [{i}] {sec.get('type', '?'):12s}  id={short_id(sid)}")
+
+            # [SILENT] scan: if ANY section contains [SILENT], suppress entire response
+            turn_silent = any(
+                '[SILENT]' in (s['text'] if isinstance(s, dict) else s)
+                for s in sections
+            )
+            if turn_silent and not getattr(monitor_thread, '_silent_logged', False):
+                print(f"[monitor] [SILENT] detected — suppressing entire response")
+                for s in sections:
+                    sk = s.get('id', '') if isinstance(s, dict) else ''
+                    if sk:
+                        forwarded_ids.add(sk)
+                sent_this_turn = True
+                monitor_thread._silent_logged = True
+            if not turn_silent:
+                monitor_thread._silent_logged = False
 
             # Walk sections in DOM order. Skip already-forwarded IDs.
             # Stop at the first un-forwarded section that isn't stable yet
@@ -2151,6 +2381,7 @@ def monitor_thread():
 
 SCAN_INTERVAL = 3     # seconds between full rescans
 SCAN_VERBOSE = False  # True = log every chat per scan (fingerprint details)
+CONTEXT_MONITOR_THRESHOLD = 85
 
 def overview_thread():
     """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
