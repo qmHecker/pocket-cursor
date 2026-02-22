@@ -805,6 +805,67 @@ def cdp_screenshot():
     return cdp_screenshot_on(active_conn())
 
 
+def cdp_hover_file_path(filename_selector):
+    """Hover over a filename element in the chat to read the full path from its tooltip.
+
+    Uses CDP Input.dispatchMouseEvent (synthetic, doesn't move the real cursor).
+    Tooltip format: 'workspace • relative\\path\\file.ext'
+    Returns the relative path (e.g., 'scripts/food-tracker/journal.md') or None.
+    """
+    try:
+        conn = active_conn()
+        pos = cdp_eval_on(conn, f"""
+            (() => {{
+                const el = document.querySelector('{filename_selector}');
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+            }})();
+        """)
+        if not pos:
+            return None
+        box = json.loads(pos)
+
+        # Hover over filename to trigger tooltip
+        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {
+            'type': 'mouseMoved',
+            'x': int(box['x']),
+            'y': int(box['y'])
+        })
+
+        # Poll for tooltip (typically appears within 50-100ms)
+        tooltip = None
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            tooltip = cdp_eval_on(conn, """
+                (() => {
+                    const hover = document.querySelector('.workbench-hover-container .hover-contents');
+                    return hover ? hover.textContent.trim() : null;
+                })();
+            """)
+            if tooltip:
+                break
+            time.sleep(0.05)
+
+        # Move mouse away to dismiss tooltip
+        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {
+            'type': 'mouseMoved',
+            'x': 0, 'y': 0
+        })
+        time.sleep(0.1)
+
+        if not tooltip:
+            return None
+        # "workspace • relative\path\file.ext" → "relative/path/file.ext"
+        parts = tooltip.split(' • ', 1)
+        if len(parts) == 2:
+            return parts[1].replace('\\', '/')
+        return tooltip.replace('\\', '/')
+    except Exception as e:
+        print(f"[monitor] cdp_hover_file_path error: {e}")
+        return None
+
+
 def cdp_screenshot_element(selector):
     """Screenshot a specific DOM element by CSS selector. Returns PNG bytes or None.
     
@@ -1423,12 +1484,11 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                         return;
                     }
 
-                    // Still loading but no buttons yet — don't classify as
-                    // file_edit or the ID will be burned before confirmation
-                    // buttons appear (race condition).
-                    if (toolStatus === 'loading') return;
-
-                    // Completed file edit (code block with diff)
+                    // File edit (code block with diff) — works for both
+                    // auto-accepted (no buttons, stays loading) and completed edits.
+                    // Stability mechanism handles the race condition: if buttons
+                    // appear on the next tick, the section becomes a confirmation
+                    // (different text/type) and stability resets.
                     const codeBlock = msg.querySelector('.composer-code-block-container');
                     if (codeBlock) {
                         const filename = msg.querySelector('.composer-code-block-filename');
@@ -1440,7 +1500,9 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             text: fname + (stat ? ' ' + stat : ''),
                             type: 'file_edit',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
-                            selector: selector
+                            selector: selector,
+                            filename_selector: '#bubble-' + bubbleSuffix + ' .composer-code-block-filename',
+                            file_stat: stat
                         });
                     }
                     return;
@@ -2310,6 +2372,13 @@ def monitor_thread():
                     # Only send to Telegram when not muted
                     tg_typing(cid)
                     if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
+                        file_path = None
+                        if sec_type == 'file_edit':
+                            fn_sel = sec.get('filename_selector') if isinstance(sec, dict) else None
+                            if fn_sel:
+                                file_path = cdp_hover_file_path(fn_sel)
+                                if file_path:
+                                    print(f"[monitor] File path: {file_path}")
                         png = None
                         if sec_selector:
                             png = cdp_screenshot_element(sec_selector)
@@ -2318,14 +2387,22 @@ def monitor_thread():
                                 '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
                             )
                         label = {'table': 'TABLE', 'file_edit': 'FILE_EDIT', 'code_block': 'CODE_BLOCK', 'latex': 'LATEX'}[sec_type]
+                        if sec_type == 'file_edit':
+                            stat = sec.get('file_stat', '') if isinstance(sec, dict) else ''
+                            display = file_path or text
+                            if file_path and stat:
+                                display = f"{file_path} {stat}"
+                            caption = f"📝 {display}"
+                        else:
+                            caption = ''
                         if png:
                             print(f"[monitor] Forwarding section {i+1} as {label} screenshot ({len(png)} bytes)")
-                            caption = f"📝 {text}" if sec_type == 'file_edit' else ''
                             tg_send_photo_bytes(cid, png, filename=f'{sec_type}.png', caption=caption)
                         else:
                             print(f"[monitor] {label} screenshot failed, sending as text ({len(text)} chars)")
                             prefix = '📝 ' if sec_type == 'file_edit' else ''
-                            tg_send(cid, f"{prefix}{text}")
+                            display_text = (file_path or text) if sec_type == 'file_edit' else text
+                            tg_send(cid, f"{prefix}{display_text}")
                     elif sec_type == 'thinking':
                         print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
                         tg_send_thinking(cid, text)
