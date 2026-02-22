@@ -138,6 +138,16 @@ cp /path/to/pocket-cursor/pocket-cursor.mdc .cursor/rules/
 
 Then open the copied file and replace all `<POCKET_CURSOR_DIR>` placeholders with the real path.
 
+## Slow image delivery on network drives (optional)
+
+The phone outbox renders styled images via Node.js and Puppeteer. If the repo lives on a network drive with high latency (e.g. NAS over VPN), this can be slow — Node.js loads hundreds of small files from `node_modules` on every render. The fix: give Node.js a local copy of its dependencies.
+
+```bash
+python setup_local_render.py /path/to/local/render
+```
+
+Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the network is fast again, remove the line — no code changes needed.
+
 ## Requirements
 
 - **Python 3.10+**

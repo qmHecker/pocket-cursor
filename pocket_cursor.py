@@ -2604,7 +2604,16 @@ def overview_thread():
 
 # ── Phone outbox renderer ─────────────────────────────────────────────────────
 
-MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
+_render_local = os.environ.get('RENDER_LOCAL_DIR', '').strip()
+if _render_local:
+    MD_TO_IMAGE_SCRIPT = Path(_render_local) / 'md_to_image.mjs'
+    if MD_TO_IMAGE_SCRIPT.exists():
+        print(f"[outbox] Using local render: {MD_TO_IMAGE_SCRIPT}")
+    else:
+        print(f"[outbox] WARNING: RENDER_LOCAL_DIR set but {MD_TO_IMAGE_SCRIPT} not found. Run setup_local_render.py")
+        MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
+else:
+    MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
 OUTBOX_MARKER_RE = re.compile(r'\[PHONE_OUTBOX:([^\]]+)\]')
 phone_outbox.mkdir(exist_ok=True)
 
