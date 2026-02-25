@@ -866,6 +866,59 @@ def cdp_hover_file_path(filename_selector):
         return None
 
 
+def cdp_try_expand(selector):
+    """Expand a collapsed element by clicking its expand chevron (if any).
+
+    Works for file edits, terminal commands, and any tool-call container
+    that has a .composer-message-codeblock-expand button.
+    Walks up from the selector to the bubble and looks for the button there.
+    Returns True if expanded, False otherwise.
+    """
+    try:
+        result = cdp_eval(f"""
+            (() => {{
+                const el = document.querySelector('{selector}');
+                if (!el) return 'no_el';
+                const bubble = el.closest('[id^="bubble-"]');
+                const btn = (bubble || el).querySelector('.composer-message-codeblock-expand');
+                if (!btn) return 'no_btn';
+                const icon = btn.querySelector('.codicon');
+                if (!icon || !icon.classList.contains('codicon-chevron-down')) return 'not_collapsed';
+                btn.click();
+                return 'expanded';
+            }})();
+        """)
+        if result == 'expanded':
+            time.sleep(0.5)
+            return True
+        if result not in ('no_btn', 'not_collapsed'):
+            print(f"[screenshot] try_expand: {result}")
+        return False
+    except Exception as e:
+        print(f"[screenshot] try_expand error: {e}")
+        return False
+
+
+def cdp_try_collapse(selector):
+    """Collapse an expanded element back by clicking its chevron-up button."""
+    try:
+        cdp_eval(f"""
+            (() => {{
+                const el = document.querySelector('{selector}');
+                if (!el) return 'skip';
+                const bubble = el.closest('[id^="bubble-"]');
+                const btn = (bubble || el).querySelector('.composer-message-codeblock-expand');
+                if (!btn) return 'skip';
+                const icon = btn.querySelector('.codicon');
+                if (icon && icon.classList.contains('codicon-chevron-up')) btn.click();
+                return 'ok';
+            }})();
+        """)
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"[screenshot] try_collapse error: {e}")
+
+
 def cdp_screenshot_element(selector):
     """Screenshot a specific DOM element by CSS selector. Returns PNG bytes or None.
     
@@ -1424,11 +1477,11 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 if (kind === 'tool') {
                     const toolStatus = msg.getAttribute('data-tool-status');
                     const toolCallId = msg.getAttribute('data-tool-call-id') || '';
-                    // Pending confirmation: find ALL action buttons in the status row
-                    const statusRow = msg.querySelector('.composer-tool-call-status-row');
-                    const actionBtns = statusRow ? statusRow.querySelectorAll('[data-click-ready="true"]') : [];
+                    // Pending confirmation: find action buttons (may be in status row
+                    // for file edits, or in menu controls for WebFetch/other tools)
+                    const actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
 
-                    if (toolStatus === 'loading' && actionBtns.length > 0) {
+                    if (actionBtns.length > 0) {
                         // Collect all buttons universally (labels + indices)
                         const buttons = Array.from(actionBtns).map((btn, idx) => ({
                             label: btn.innerText.trim().replace(/\\s+/g, ' '),
@@ -1478,7 +1531,7 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             type: 'confirmation',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
                             selector: bubbleSelector + ' .composer-tool-former-message > div',
-                            buttons_selector: bubbleSelector + ' .composer-tool-call-status-row [data-click-ready="true"]',
+                            buttons_selector: bubbleSelector + ' [data-click-ready="true"]',
                             buttons: buttons
                         });
                         return;
@@ -2380,8 +2433,12 @@ def monitor_thread():
                                 if file_path:
                                     print(f"[monitor] File path: {file_path}")
                         png = None
+                        expanded = False
                         if sec_selector:
+                            expanded = cdp_try_expand(sec_selector)
                             png = cdp_screenshot_element(sec_selector)
+                            if expanded:
+                                cdp_try_collapse(sec_selector)
                         if not png and sec_type == 'table':
                             png = cdp_screenshot_element(
                                 '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
