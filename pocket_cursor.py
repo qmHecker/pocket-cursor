@@ -1537,13 +1537,14 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                         return;
                     }
 
-                    // File edit (code block with diff) — works for both
-                    // auto-accepted (no buttons, stays loading) and completed edits.
-                    // Stability mechanism handles the race condition: if buttons
-                    // appear on the next tick, the section becomes a confirmation
-                    // (different text/type) and stability resets.
+                    // File edit (code block with diff).
+                    // While the AI is still writing, a loading spinner
+                    // (.cursorLoadingBackground) is visible. Don't classify yet —
+                    // once writing finishes, either buttons appear (blocked edit →
+                    // confirmation) or not (auto-accepted → file_edit).
                     const codeBlock = msg.querySelector('.composer-code-block-container');
                     if (codeBlock) {
+                        if (codeBlock.querySelector('.cursorLoadingBackground')) return;
                         const filename = msg.querySelector('.composer-code-block-filename');
                         const status = msg.querySelector('.composer-code-block-status');
                         const fname = filename ? filename.textContent.trim() : 'file';
