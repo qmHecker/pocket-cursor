@@ -17,6 +17,9 @@
 _phone_outbox/
 !_phone_outbox/_EXAMPLE.md
 
+# Voice message input (transient, user-specific)
+scripts/voice_message.json
+
 # Local test/scratch scripts
 tests/
 .commitmsg

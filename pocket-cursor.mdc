@@ -10,6 +10,26 @@ alwaysApply: true
 - **Auto-restart:** When editing any file under `<POCKET_CURSOR_DIR>`, always restart the bridge after changes that affect runtime behavior (bug fixes, features, refactors). Do not wait for the user to ask.
 - If the user reports unexpected behavior, check if a restart is needed first.
 
+## Phone outbox ("send to phone", "phone outbox")
+
+- **Folder:** `<POCKET_CURSOR_DIR>/_phone_outbox/`
+- **Example:** `<POCKET_CURSOR_DIR>/_phone_outbox/_EXAMPLE.md`
+- Write a `.md` file there, then include `[PHONE_OUTBOX:filename.md]` in your response to send it as a styled image to the user's phone.
+- **Caption:** Text in the same message as the marker becomes the image caption — sent as **one** Telegram message (photo + text). Put the marker and caption text together without tool calls or blank lines between them, e.g.: `Here's the summary [PHONE_OUTBOX:filename.md]`
+- Image width via filename convention: `filename.w800.md` → 800px wide. Default is 450px (phone portrait).
+
+## Voice messages ("voice message", "send voice", "sag mir", "lies vor")
+
+Write JSON to `scripts/voice_message.json`, then run `scripts/voice_message.py`.
+
+**JSON fields** (only `text` required):
+- `text`: The message text. Supports Audio Tags: `[excited]`, `[pause]`, `[rushed]`, `[whisper]`, `[sad]`, `[laughs]`, `[slows down]`
+- `language`: `"de"` or `"en"`. Omit for auto-detect.
+- `stability`: 0.0 (expressive), 0.5 (balanced), 1.0 (calm). Vary naturally across messages for a human feel.
+- `speed`: default 1.2
+- `similarity_boost`: 0.5 or 0.75 (both good, vary for natural feel)
+- `caption`: optional Telegram caption
+
 ## Context monitor (requires `CONTEXT_MONITOR=true` in `.env`)
 
 User messages may start with `[ContextMonitor: ...]`. This means:
@@ -19,11 +39,3 @@ User messages may start with `[ContextMonitor: ...]`. This means:
 - **"context was summarized (X% -> Y%)"**: Context was just compressed. Check `.pocket-cursor/journals/` for notes you left yourself before the summary.
 
 **`.pocket-cursor/journals/` is your space.** Think of it as notes from yourself to your future self. It might be a reflection, a fact that matters, a thread you're not done pulling, or something that doesn't fit anywhere else. What you write, when, and how is your call. There's no template.
-
-## Phone outbox ("send to phone", "phone outbox")
-
-- **Folder:** `<POCKET_CURSOR_DIR>/_phone_outbox/`
-- **Example:** `<POCKET_CURSOR_DIR>/_phone_outbox/_EXAMPLE.md`
-- Write a `.md` file there, then include `[PHONE_OUTBOX:filename.md]` in your response to send it as a styled image to the user's phone.
-- **Caption:** Text in the same message as the marker becomes the image caption — sent as **one** Telegram message (photo + text). Put the marker and caption text together without tool calls or blank lines between them, e.g.: `Here's the summary [PHONE_OUTBOX:filename.md]`
-- Image width via filename convention: `filename.w800.md` → 800px wide. Default is 450px (phone portrait).

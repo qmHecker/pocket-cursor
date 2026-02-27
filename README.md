@@ -11,6 +11,7 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 ## What it's like to use
 
 - **Voice messages.** Speak into Telegram. It gets transcribed and forwarded to Cursor.
+- **Voice replies.** The AI can reply as a voice message. Text-to-speech via ElevenLabs, delivered as a Telegram voice note.
 - **Streaming responses.** AI responses arrive on your phone section by section, as they're generated. Not one block when done.
 - **Rich content as images.** Code blocks, LaTeX formulas, tables, and file diffs arrive as clean screenshots on your phone.
 - **Interactive confirmations.** When Cursor needs approval, the action buttons appear on Telegram. One tap.
@@ -67,7 +68,7 @@ PocketCursor sets up the bot description and command menu automatically on first
 cp .env.example .env
 ```
 
-Edit `.env` and add your bot token (and optionally your OpenAI API key for voice):
+Edit `.env` and add your bot token. Optional: OpenAI API key for voice transcription, ElevenLabs API key for voice replies.
 
 ```
 TELEGRAM_BOT_TOKEN=your-token-here
@@ -155,6 +156,7 @@ Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the netwo
 - **Cursor IDE** launched with `--remote-debugging-port=9222`
 - **Telegram bot token** (free, via @BotFather)
 - **OpenAI API key** (optional, for voice transcription)
+- **ElevenLabs API key** (optional, for text-to-speech voice replies)
 
 ## License
 
