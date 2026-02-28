@@ -17,6 +17,10 @@
       ]
     },
     {
+      "group": "Web fetch (read-only)",
+      "patterns": ["Fetch http*"]
+    },
+    {
       "group": "Shell (navigation)",
       "patterns": ["cd *"]
     },
@@ -28,6 +32,25 @@
         "cat *",
         "head *",
         "type *"
+      ]
+    },
+    {
+      "group": "Calendar (read-only)",
+      "patterns": [
+        "python *calendar_client.py* list*",
+        "python *calendar_client.py* --week*"
+      ]
+    },
+    {
+      "group": "PocketCursor voice",
+      "patterns": [
+        "python *voice_message.py*"
+      ]
+    },
+    {
+      "group": "Email/calendar watcher",
+      "patterns": [
+        "python *restart_watcher.py*"
       ]
     }
   ],

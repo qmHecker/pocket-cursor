@@ -1730,14 +1730,14 @@ def sender_thread():
 
     while True:
         try:
-            updates = tg_call('getUpdates', offset=offset, timeout=30)
+            updates = tg_call('getUpdates', offset=offset, timeout=30,
+                                allowed_updates=['message', 'callback_query'])
             if not updates.get('ok'):
                 time.sleep(2)
                 continue
 
             for update in updates['result']:
                 offset = update['update_id'] + 1
-
                 # Handle inline keyboard callbacks (Accept/Reject)
                 callback = update.get('callback_query')
                 if callback:
@@ -1745,13 +1745,17 @@ def sender_thread():
                     cb_id = callback.get('id')
                     cb_user_id = callback.get('from', {}).get('id')
 
+                    print(f"[sender] Callback: data={cb_data!r} user={cb_user_id}")
+
                     # Only owner can press buttons
                     if OWNER_ID and cb_user_id != OWNER_ID:
+                        print(f"[sender] Callback ignored: not owner ({cb_user_id} != {OWNER_ID})")
                         continue
 
                     action, _, tool_id = cb_data.partition(':')
                     with pending_confirms_lock:
                         selectors = pending_confirms.pop(tool_id, None)
+                    print(f"[sender] Callback: action={action!r} tool_id={tool_id[:12]}... selectors={'found' if selectors else 'NONE'}")
 
                     if cb_data == 'noop':
                         tg_call('answerCallbackQuery', callback_query_id=cb_id)
