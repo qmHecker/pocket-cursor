@@ -31,6 +31,7 @@ from urllib.parse import unquote, urlparse
 # Sibling modules
 from start_cursor import get_used_ports
 from chat_detection import install_chat_listener, start_chat_listener, list_chats, ts_print
+from lib import command_rules
 
 # Third-party
 import requests
@@ -65,6 +66,9 @@ if not OPENAI_API_KEY:
 
 # Context journal: prefill annotation into chat input when context window is filling up
 CONTEXT_MONITOR = os.environ.get('CONTEXT_MONITOR', '').lower() in ('true', '1', 'yes')
+
+# Command rules: auto-accept/deny Cursor tool confirmations based on allow/deny patterns
+COMMAND_RULES = os.environ.get('COMMAND_RULES', '').lower() in ('true', '1', 'yes')
 
 # Owner lock: only respond to this Telegram user ID
 # Set in .env or auto-captured on first /start command
@@ -459,7 +463,7 @@ def _handle_chat_switch(iid, data):
                     print(f"[dom] Suppressed notification (returned to same chat: {n})")
                     return
                 try:
-                    tg_send(chat_id, f"\U0001f4ac Chat activated: {n}  ({wsl})")
+                    tg_send(chat_id, f"💬 Chat activated: {n}  ({wsl})")
                 except Exception:
                     pass
 
@@ -2237,9 +2241,9 @@ def monitor_thread():
                             info = instance_registry.get(mc[0], {})
                             ws_label = (info.get('workspace') or '').removesuffix(' (Workspace)')
                         if ws_label:
-                            tg_send(cid, f"\U0001f4ac Chat activated: {conv}  ({ws_label})")
+                            tg_send(cid, f"💬 Chat activated: {conv}  ({ws_label})")
                         else:
-                            tg_send(cid, f"\U0001f4ac Chat activated: {conv}")
+                            tg_send(cid, f"💬 Chat activated: {conv}")
                     forwarded_ids = {
                         sec.get('id', '') for sec in sections
                         if isinstance(sec, dict) and sec.get('id')
@@ -2409,6 +2413,39 @@ def monitor_thread():
                             'buttons_selector': btns_selector,
                             'buttons': buttons
                         }
+
+                    # Auto-accept: check command text against allow/deny rules
+                    rule_result = command_rules.match(text) if COMMAND_RULES else None
+                    if rule_result == 'accept' and btns_selector:
+                        accept_idx, accept_label = command_rules.find_accept_button(buttons)
+                        if accept_idx is not None:
+                            # Screenshot BEFORE click (click changes DOM)
+                            png = cdp_screenshot_element(sec_selector) if sec_selector else None
+                            click_result = cdp_eval(f"""
+                                (function() {{
+                                    const btns = document.querySelectorAll('{btns_selector}');
+                                    if (!btns[{accept_idx}]) return 'ERROR: button not found';
+                                    btns[{accept_idx}].click();
+                                    return 'OK';
+                                }})();
+                            """)
+                            if click_result and click_result.strip() == 'OK':
+                                print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
+                                if not muted and cid:
+                                    if png:
+                                        tg_send_photo_bytes(cid, png, filename='auto_accept.png',
+                                                            caption=f"✅ Auto: {text}")
+                                    else:
+                                        tg_send(cid, f"✅ Auto: {text}")
+                                with pending_confirms_lock:
+                                    pending_confirms.pop(tool_id, None)
+                                if sec_key:
+                                    forwarded_ids.add(sec_key)
+                                section_stable.pop(sec_key, None)
+                                continue
+                            else:
+                                print(f"[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard")
+
                     if not muted:
                         tg_typing(cid)
                         png = None

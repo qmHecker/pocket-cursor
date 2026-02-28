@@ -112,6 +112,33 @@ If Cursor requires you to confirm command execution, a normal restart (kill + st
 python restart_pocket_cursor.py
 ```
 
+## Command Rules (optional)
+
+When Cursor asks for confirmation before running a command, the buttons appear on Telegram for you to tap. That works well for important decisions, but gets tedious for harmless things like `ls`, `git status`, or `cd`. Command rules let you define which commands auto-run and which always require your approval.
+
+Cursor has a built-in allowlist, but it works at executable level: allowing `Shell(python)` means trusting *every* Python script. Command rules match the full command text, so you can allow `python *restart_pocket_cursor.py*` without blindly trusting all of Python. Deny patterns scan the entire command string, including chained commands, so `ls && rm -rf /` is blocked even though `ls` alone would pass.
+
+Every auto-accepted command still sends a screenshot notification to Telegram, so you stay informed even when away from your desk.
+
+```json
+{
+  "allow": [
+    { "group": "Shell (safe)", "patterns": ["ls *", "cd *", "git status*", "git diff*"] }
+  ],
+  "deny": [
+    { "group": "Destructive", "patterns": ["rm ", "--force", "--hard"] }
+  ]
+}
+```
+
+Rules live in `lib/command_rules.json` and are hot-reloaded. Deny always wins.
+
+To enable, add to your `.env`:
+
+```
+COMMAND_RULES=true
+```
+
 ## Context Monitor (optional)
 
 PocketCursor can monitor your context window fill level and remind the AI to save its working memory before a summary compresses it.

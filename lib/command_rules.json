@@ -1,0 +1,48 @@
+{
+  "description": "Auto-accept rules for Cursor tool confirmations. A command is auto-accepted only when it matches an allow pattern AND contains no deny keyword. Deny always wins.",
+  "allow": [
+    {
+      "group": "PocketCursor scripts",
+      "patterns": [
+        "python *restart_pocket_cursor.py*"
+      ]
+    },
+    {
+      "group": "Git (read-only)",
+      "patterns": [
+        "git status*",
+        "git log*",
+        "git diff*",
+        "git branch*"
+      ]
+    },
+    {
+      "group": "Shell (navigation)",
+      "patterns": ["cd *"]
+    },
+    {
+      "group": "Shell (read-only)",
+      "patterns": [
+        "ls *",
+        "dir *",
+        "cat *",
+        "head *",
+        "type *"
+      ]
+    }
+  ],
+  "deny": [
+    {
+      "group": "Destructive operations",
+      "patterns": ["rm ", "rmdir", "delete", "remove", "unlink", "drop "]
+    },
+    {
+      "group": "Dangerous flags",
+      "patterns": ["--force", "--hard"]
+    },
+    {
+      "group": "System commands",
+      "patterns": ["format ", "> /dev/null", "shutdown", "reboot"]
+    }
+  ]
+}
