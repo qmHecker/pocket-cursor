@@ -326,20 +326,25 @@ def transcribe_voice(audio_bytes, filename='voice.ogg'):
 
 # ── CDP helpers ──────────────────────────────────────────────────────────────
 
-def detect_cdp_port():
+def detect_cdp_port(exit_on_fail=True):
     """Auto-detect the CDP port from running Cursor processes.
     
     Uses start_cursor.get_used_ports() to parse process command lines,
     then verifies each port actually responds.  On Windows, merged windows
     leave ghost --remote-debugging-port entries in the launcher process's
     command line even though only the original port is bound.
+    
+    When exit_on_fail=False (used by background threads), returns None
+    instead of calling sys.exit() so the caller can retry next cycle.
     """
     ports = get_used_ports()
     if not ports:
-        print("ERROR: No Cursor process with CDP detected.")
-        print("Start Cursor with CDP first:  python start_cursor.py")
-        print("Or check status:              python start_cursor.py --check")
-        sys.exit(1)
+        if exit_on_fail:
+            print("ERROR: No Cursor process with CDP detected.")
+            print("Start Cursor with CDP first:  python start_cursor.py")
+            print("Or check status:              python start_cursor.py --check")
+            sys.exit(1)
+        return None
     for port in ports:
         try:
             resp = requests.get(f'http://localhost:{port}/json', timeout=2)
@@ -347,10 +352,12 @@ def detect_cdp_port():
                 return port
         except Exception:
             pass
-    print("ERROR: Cursor process found but no CDP port is responding.")
-    print(f"Ports in command line: {ports}")
-    print("Start Cursor with CDP first:  python start_cursor.py")
-    sys.exit(1)
+    if exit_on_fail:
+        print("ERROR: Cursor process found but no CDP port is responding.")
+        print(f"Ports in command line: {ports}")
+        print("Start Cursor with CDP first:  python start_cursor.py")
+        sys.exit(1)
+    return None
 
 
 def parse_instance_title(title):
@@ -2536,11 +2543,31 @@ def overview_thread():
             if conv['active']:
                 mirrored_chat = (active_instance_id, pc_id, conv['name'])
                 break
+    _overview_start = time.time()
+    _scan_cycle = 0
+    _cdp_miss_count = 0
+    _HEARTBEAT_CYCLES = 85  # ~10 min (3s sleep + ~4s scan ≈ 7s per cycle)
     while True:
         try:
             time.sleep(SCAN_INTERVAL)
+            _scan_cycle += 1
 
-            port = detect_cdp_port()
+            if _scan_cycle % _HEARTBEAT_CYCLES == 0:
+                uptime_s = int(time.time() - _overview_start)
+                h, m = uptime_s // 3600, (uptime_s % 3600) // 60
+                n_inst = len(instance_registry)
+                n_chats = sum(len(info.get('convs', {})) for info in instance_registry.values())
+                print(f"[overview] heartbeat: {n_inst} instances, {n_chats} chats, uptime {h}h{m:02d}m")
+
+            port = detect_cdp_port(exit_on_fail=False)
+            if port is None:
+                _cdp_miss_count += 1
+                if _cdp_miss_count == 1:
+                    print("[overview] CDP port unavailable, will keep retrying...")
+                continue
+            if _cdp_miss_count > 0:
+                print(f"[overview] CDP port recovered after {_cdp_miss_count} missed cycles")
+                _cdp_miss_count = 0
             current = cdp_list_instances(port)
             current_ids = {inst['id'] for inst in current}
             known_ids = set(instance_registry.keys())
@@ -2732,8 +2759,11 @@ def overview_thread():
                 parts = '  '.join(f"{ws} ({n})" for ws, n in scan_summary.items())
                 print(f"[overview] chat scan: {parts}")
 
-        except Exception as e:
-            print(f"[overview] Error: {e}")
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                print(f"[overview] Caught {type(e).__name__} — overview thread staying alive")
+            else:
+                print(f"[overview] Error: {e}")
             time.sleep(5)
 
 
