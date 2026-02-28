@@ -20,6 +20,9 @@ _phone_outbox/
 # Voice message input (transient, user-specific)
 scripts/voice_message.json
 
+# Runtime logs (audio quality metrics etc.)
+logs/
+
 # Local test/scratch scripts
 tests/
 .commitmsg
