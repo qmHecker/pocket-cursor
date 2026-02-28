@@ -15,6 +15,7 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 - **Streaming responses.** AI responses arrive on your phone section by section, as they're generated. Not one block when done.
 - **Rich content as images.** Code blocks, LaTeX formulas, tables, and file diffs arrive as clean screenshots on your phone.
 - **Interactive confirmations.** When Cursor needs approval, the action buttons appear on Telegram. One tap.
+- **Command rules.** Safe commands like `git status` can auto-run without waiting for your phone. You define allow and deny patterns. Deny always wins.
 - **Images both ways.** Send photos from your phone into Cursor's editor. Images from Cursor arrive on Telegram.
 - **Multi-workspace.** Detects all open Cursor workspaces. Switch between them from your phone via `/chats`.
 - **Auto-follows your focus.** Switch chats on your PC and the bridge follows. Switch from your phone and Cursor follows. Both directions, always in sync.
@@ -68,11 +69,10 @@ PocketCursor sets up the bot description and command menu automatically on first
 cp .env.example .env
 ```
 
-Edit `.env` and add your bot token. Optional: OpenAI API key for voice transcription, ElevenLabs API key for voice replies.
+Edit `.env` and add your Telegram bot token. The file lists all available options with descriptions.
 
 ```
 TELEGRAM_BOT_TOKEN=your-token-here
-OPENAI_API_KEY=your-key-here
 ```
 
 ### 3. Install dependencies

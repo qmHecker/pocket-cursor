@@ -15,6 +15,8 @@ _RULES_FILE = Path(__file__).parent / 'command_rules.json'
 _rules_mtime = 0.0
 _rules = {'allow': [], 'deny': []}
 
+# Button priority: most conservative first. "Allow" grants broader
+# permission (whole directory) -- deliberately excluded for now.
 _ACCEPT_KEYWORDS = ('accept', 'run', 'fetch')
 
 
