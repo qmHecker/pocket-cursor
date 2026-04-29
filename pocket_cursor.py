@@ -1490,7 +1490,15 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     const toolCallId = msg.getAttribute('data-tool-call-id') || '';
                     // Pending confirmation: find action buttons (may be in status row
                     // for file edits, or in menu controls for WebFetch/other tools)
-                    const actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
+                    let actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
+                    let btnSelector = '[data-click-ready="true"]';
+                    
+                    // Fallback: try generic button selector if old one fails
+                    if (actionBtns.length === 0) {
+                        // Try finding Run/Skip buttons specifically
+                        actionBtns = msg.querySelectorAll('button');
+                        btnSelector = 'button';
+                    }
 
                     if (actionBtns.length > 0) {
                         // Collect all buttons universally (labels + indices)
@@ -1542,7 +1550,7 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             type: 'confirmation',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
                             selector: bubbleSelector + ' .composer-tool-former-message > div',
-                            buttons_selector: bubbleSelector + ' [data-click-ready="true"]',
+                            buttons_selector: bubbleSelector + ' ' + btnSelector,
                             buttons: buttons
                         });
                         return;
@@ -1607,13 +1615,27 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 }
 
                 // --- AI text messages (markdown sections, code blocks + tables) ---
-                const root = msg.querySelector('.anysphere-markdown-container-root');
-                if (!root) return;
+                // Try multiple possible selectors for the markdown container
+                // (Cursor UI changes over time, so we try several)
+                let root = msg.querySelector('.markdown-root');
+                if (!root) root = msg.querySelector('.anysphere-markdown-container-root');
+                if (!root) root = msg.querySelector('[class*="markdown-root"]');
+                if (!root) {
+                    return;
+                }
                 let tableIndex = 0;
 
+                // Handle new Cursor UI structure: .markdown-root > .space-y-4 > <p>
+                // Also handle old structure: .markdown-root > .markdown-section
+                let contentContainer = root.querySelector('.space-y-4') || root;
+                
                 let codeBlockIndex = 0;
-                for (const child of root.children) {
-                    if (child.classList.contains('markdown-section')) {
+                for (const child of contentContainer.children) {
+                    // Handle both old (.markdown-section) and new (<p>, <div>) structures
+                    const isMarkdownSection = child.classList.contains('markdown-section');
+                    const isTextElement = ['P', 'DIV', 'SPAN', 'UL', 'OL'].includes(child.tagName);
+                    
+                    if (isMarkdownSection || isTextElement) {
                         // Code blocks live inside markdown-section but should be screenshotted
                         const codeBlock = child.querySelector('.markdown-block-code');
                         const latexBlock = child.querySelector('.markdown-block-latex');

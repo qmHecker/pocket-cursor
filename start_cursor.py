@@ -111,9 +111,13 @@ def is_cursor_running():
         except Exception:
             return False
     else:
+        # macOS: pgrep -f Cursor matches unrelated processes (browser tabs, helpers, etc.),
+        # which can falsely report Cursor running and block start_cursor.py. Match the app binary.
         try:
+            pattern = 'Cursor.app/Contents/MacOS/Cursor' if sys.platform == 'darwin' else 'Cursor'
             result = subprocess.run(
-                ['pgrep', '-f', 'Cursor'], capture_output=True, timeout=10
+                ['pgrep', '-f', pattern],
+                capture_output=True, timeout=10
             )
             return result.returncode == 0
         except Exception:
@@ -176,7 +180,7 @@ def find_available_port(exclude=None, quiet=False):
 
 def count_page_targets(port):
     """Count Cursor page targets on a CDP port.
-    
+
     Matches on vscode-file:// URL (reliable from first load) with
     title-based fallback for edge cases.
     """
@@ -194,7 +198,7 @@ def count_page_targets(port):
 
 def verify_cdp(port, timeout=15):
     """Poll the CDP endpoint until it responds or timeout is reached.
-    
+
     With timeout=0, performs a single instant check (no polling).
     """
     import urllib.request
